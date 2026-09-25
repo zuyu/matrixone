@@ -26,7 +26,7 @@
     <maven.compiler.source>1.8</maven.compiler.source>
     <maven.compiler.target>1.8</maven.compiler.target>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <grpc.version>1.68.1</grpc.version>
+    <grpc.version>1.75.0</grpc.version>
     <protobuf.version>3.25.5</protobuf.version>
     <!-- Pin every plugin reached by the package lifecycle.  Leaving these
          implicit makes a clean CI runner resolve today's latest plugin,
@@ -79,7 +79,7 @@
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
-      <version>2.17.2</version>
+      <version>2.18.9</version>
     </dependency>
     <dependency>
       <groupId>com.mysql</groupId>
