@@ -223,3 +223,96 @@ func TestDataBranchRestoreEmptyStages(t *testing.T) {
 		}
 	})
 }
+
+func TestDataBranchRestoreCatalogScopeAndRefresh(t *testing.T) {
+	runSQLIntegration(t, func(c embed.Cluster) {
+		cn, err := c.GetCNService(0)
+		require.NoError(t, err)
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+		defer cancel()
+		db, err := sql.Open("mysql", fmt.Sprintf("dump:111@tcp(127.0.0.1:%d)/", cn.GetServiceConfig().CN.Frontend.Port))
+		require.NoError(t, err)
+		defer db.Close()
+		db.SetMaxOpenConns(1)
+		for _, q := range []string{
+			"create database restore_catalog", "create database restore_other",
+			"create table restore_catalog.a(id int primary key,v int)",
+			"create table restore_catalog.z(id int primary key,v int)",
+			"create index restore_index on restore_catalog.a(v)",
+			"create view restore_catalog.filtered_view as select * from restore_catalog.a",
+			"insert into restore_catalog.a values(1,10)", "insert into restore_catalog.z values(1,20)",
+			"create snapshot restore_catalog_before for database restore_catalog",
+			"create snapshot restore_table_only for table restore_catalog a",
+			"create snapshot restore_other_snapshot for database restore_other",
+			"update restore_catalog.a set v=11", "update restore_catalog.z set v=21",
+			"create snapshot restore_catalog_after for database restore_catalog",
+		} {
+			execSQLRequire(t, ctx, db, q)
+		}
+		defer cleanupSQLIntegration(t, cn, "drop database if exists restore_catalog")
+		defer cleanupSQLIntegration(t, cn, "drop database if exists restore_other")
+		for _, name := range []string{"restore_catalog_before", "restore_catalog_after", "restore_table_only", "restore_other_snapshot"} {
+			defer execSQLRequire(t, ctx, db, "drop snapshot "+name)
+		}
+		value := func(table string) int {
+			var v int
+			require.NoError(t, db.QueryRowContext(ctx, "select v from restore_catalog."+table).Scan(&v))
+			return v
+		}
+		reset := "data branch reset database restore_catalog from restore_catalog{snapshot='restore_catalog_before'}"
+		revert := "data branch revert database restore_catalog from restore_catalog{snapshot='restore_catalog_after'} against restore_catalog{snapshot='restore_catalog_before'}"
+		// Reject wrong database and table-only snapshots before any target write.
+		for _, q := range []string{
+			"data branch reset database restore_catalog from restore_catalog{snapshot='restore_other_snapshot'}",
+			"data branch reset database restore_catalog from restore_catalog{snapshot='restore_table_only'} tables(a)",
+			"data branch revert database restore_catalog from restore_catalog{snapshot='restore_catalog_after'} against restore_catalog{snapshot='restore_other_snapshot'}",
+		} {
+			_, err = db.ExecContext(ctx, q)
+			require.Error(t, err)
+			require.Equal(t, 11, value("a"))
+		}
+		// Authorization must still cover every selected table before applying a.
+		for _, q := range []string{
+			"create role restore_catalog_role",
+			"grant select,insert,update,delete on table restore_catalog.a to restore_catalog_role",
+			"grant select on table restore_catalog.z to restore_catalog_role",
+			"create user restore_catalog_user identified by '111' default role restore_catalog_role",
+		} {
+			execSQLRequire(t, ctx, db, q)
+		}
+		defer execSQLRequire(t, ctx, db, "drop role restore_catalog_role")
+		defer execSQLRequire(t, ctx, db, "drop user restore_catalog_user")
+		limited, err := sql.Open("mysql", fmt.Sprintf("restore_catalog_user:111@tcp(127.0.0.1:%d)/", cn.GetServiceConfig().CN.Frontend.Port))
+		require.NoError(t, err)
+		defer limited.Close()
+		for _, q := range []string{reset, revert} {
+			_, err = limited.ExecContext(ctx, q+" tables(a,z)")
+			require.ErrorContains(t, err, "privilege")
+			require.Equal(t, 11, value("a"))
+		}
+		execSQLRequire(t, ctx, db, reset)
+		require.Equal(t, 10, value("a"))
+		require.Equal(t, 20, value("z"))
+		// A later definition change cannot reuse a previous statement's catalog.
+		execSQLRequire(t, ctx, db, "update restore_catalog.a set v=99")
+		execSQLRequire(t, ctx, db, "alter table restore_catalog.z add column added int")
+		for _, q := range []string{reset, revert} {
+			_, err = db.ExecContext(ctx, q)
+			require.ErrorContains(t, err, "matching writable columns")
+			require.Equal(t, 99, value("a"))
+		}
+		execSQLRequire(t, ctx, db, "alter table restore_catalog.z drop column added")
+		execSQLRequire(t, ctx, db, revert)
+		require.Equal(t, 10, value("a"))
+		// Reusing a snapshot name must resolve its new timestamp on the next call.
+		execSQLRequire(t, ctx, db, "drop snapshot restore_catalog_before")
+		execSQLRequire(t, ctx, db, "update restore_catalog.a set v=77")
+		execSQLRequire(t, ctx, db, "create snapshot restore_catalog_before for database restore_catalog")
+		execSQLRequire(t, ctx, db, "update restore_catalog.a set v=88")
+		execSQLRequire(t, ctx, db, reset)
+		require.Equal(t, 77, value("a"))
+		var stages int
+		require.NoError(t, db.QueryRowContext(ctx, "select count(*) from mo_catalog.mo_tables where reldatabase='restore_catalog' and relname like '__mo_branch_restore_%'").Scan(&stages))
+		require.Zero(t, stages)
+	})
+}

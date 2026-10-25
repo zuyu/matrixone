@@ -11,16 +11,19 @@
 package frontend
 
 import (
-	"context"
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
+	"go.uber.org/zap"
 )
 
 type branchRestorePlan struct {
@@ -56,21 +59,35 @@ func handleBranchRestore(execCtx *ExecCtx, ses *Session, stmt *tree.DataBranchDa
 		return err
 	}
 	defer finishDataBranchComponent(ctx, finish, &err)
-	source, err := branchDatabaseTables(ctx, ses, bh, stmt.Source)
+	metadataStarted := time.Now()
+	sourceCatalog, err := loadBranchDatabaseCatalog(ctx, ses, bh, stmt.Source, true)
 	if err != nil {
 		return err
 	}
-	destination, err := branchDatabaseTables(ctx, ses, bh, stmt.Destination)
+	destinationCatalog, err := loadBranchDatabaseCatalog(ctx, ses, bh, stmt.Destination, true)
 	if err != nil {
 		return err
 	}
-	before := source
+	beforeCatalog := sourceCatalog
 	if stmt.Operation == "revert" {
-		before, err = branchDatabaseTables(ctx, ses, bh, stmt.Before)
+		beforeCatalog, err = loadBranchDatabaseCatalog(ctx, ses, bh, stmt.Before, true)
 		if err != nil {
 			return err
 		}
 	}
+	// These definitions belong only to this statement's planning phase;
+	// no target writes have happened and nothing is retained on the session.
+	source, destination, before := sourceCatalog.tables, destinationCatalog.tables, beforeCatalog.tables
+	endpoints, snapshots := 2, 1
+	relationOpens := sourceCatalog.relationOpens + destinationCatalog.relationOpens
+	if stmt.Operation == "revert" {
+		endpoints, snapshots = 3, 2
+		relationOpens += beforeCatalog.relationOpens
+	}
+	logutil.Info("DataBranch-Restore-Metadata", zap.Int("schema_version", 1),
+		zap.String("operation", stmt.Operation), zap.Int("database_opens", endpoints),
+		zap.Int("snapshot_resolutions", snapshots), zap.Int("relation_opens", relationOpens),
+		zap.Float64("catalog_ms", float64(time.Since(metadataStarted))/float64(time.Millisecond)))
 	names, err := selectBranchDatabaseTables(stmt, source, destination)
 	if err != nil {
 		return err
@@ -106,7 +123,7 @@ func handleBranchRestore(execCtx *ExecCtx, ses *Session, stmt *tree.DataBranchDa
 				}
 			}
 		}
-		p, err := planBranchRestore(ctx, ses, bh, stmt, name)
+		p, err := planBranchRestore(stmt, name, sourceCatalog, destinationCatalog, beforeCatalog)
 		if err != nil {
 			return err
 		}
@@ -161,20 +178,39 @@ func branchRestoreWritableColumns(def *plan.TableDef) []string {
 	return names
 }
 
-func planBranchRestore(ctx context.Context, ses *Session, bh BackgroundExec, stmt *tree.DataBranchDatabase, table string) (branchRestorePlan, error) {
+// Validate selected definitions even though database scope was checked while
+// loading the catalog. Timestamp-only hints have no named-object restriction.
+func (c *branchDatabaseCatalog) restoreTable(endpoint tree.TableName, table string) (*plan.TableDef, error) {
+	def := c.definitions[table]
+	if def == nil {
+		return nil, moerr.NewInvalidInputNoCtxf("missing restore definition for table %q", table)
+	}
+	if endpoint.AtTsExpr != nil && endpoint.AtTsExpr.Type == tree.ATTIMESTAMPSNAPSHOT {
+		if err := plan2.ValidateSnapshotScope(c.snapshot, endpoint.ObjectName.String(), table,
+			def.DbId, plan2.SnapshotTableID(def)); err != nil {
+			return nil, err
+		}
+	}
+	return def, nil
+}
+
+func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, destination, before *branchDatabaseCatalog) (branchRestorePlan, error) {
 	p := branchRestorePlan{}
 	srcName, dstName := branchDatabaseTable(stmt.Source, table), branchDatabaseTable(stmt.Destination, table)
-	src, dst, srcSnapshot, _, err := getRelations(ctx, ses, bh, srcName, dstName)
+	srcDef, err := source.restoreTable(stmt.Source, table)
 	if err != nil {
 		return p, err
 	}
-	// CTAS executes its SELECT through the internal executor, which has no
-	// session snapshot-name resolver. Scope was validated by getRelations;
-	// use the resolved timestamp in generated SQL, as clone/restore do.
-	if srcSnapshot != nil && srcSnapshot.TS != nil {
-		srcName.AtTsExpr = newMoTimestampHint(srcSnapshot.TS.PhysicalTime)
+	dstDef, err := destination.restoreTable(stmt.Destination, table)
+	if err != nil {
+		return p, err
 	}
-	srcDef, dstDef := src.GetTableDef(ctx), dst.GetTableDef(ctx)
+	// The catalog resolved the named snapshot and validated its scope. CTAS
+	// needs the timestamp because its internal executor has no name resolver.
+	if snapshot := source.snapshot; snapshot != nil && snapshot.TS != nil {
+		srcName.AtTsExpr = newMoTimestampHint(snapshot.TS.PhysicalTime)
+	}
+
 	dstKind, dstKeys := dataBranchPrimaryKeyColumns(dstDef)
 	srcKind, srcKeys := dataBranchPrimaryKeyColumns(srcDef)
 	if dstKind != srcKind || !slices.Equal(dstKeys, srcKeys) {
@@ -221,14 +257,13 @@ func planBranchRestore(ctx context.Context, ses *Session, bh BackgroundExec, stm
 			branchRestoreColumns("d", p.keys), p.destination, source, join, firstKey)
 	} else {
 		beforeName := branchDatabaseTable(stmt.Before, table)
-		before, _, beforeSnapshot, _, err := getRelations(ctx, ses, bh, beforeName, dstName)
+		beforeDef, err := before.restoreTable(stmt.Before, table)
 		if err != nil {
 			return p, err
 		}
-		if beforeSnapshot != nil && beforeSnapshot.TS != nil {
-			beforeName.AtTsExpr = newMoTimestampHint(beforeSnapshot.TS.PhysicalTime)
+		if snapshot := before.snapshot; snapshot != nil && snapshot.TS != nil {
+			beforeName.AtTsExpr = newMoTimestampHint(snapshot.TS.PhysicalTime)
 		}
-		beforeDef := before.GetTableDef(ctx)
 		kind, keys := dataBranchPrimaryKeyColumns(beforeDef)
 		if kind != dstKind || !slices.Equal(keys, p.keys) {
 			return p, moerr.NewInvalidInputNoCtxf("database REVERT primary keys differ for table %q", table)

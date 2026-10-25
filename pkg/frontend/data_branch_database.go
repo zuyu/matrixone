@@ -19,9 +19,11 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 )
 
 type branchDatabaseResult struct {
@@ -154,7 +156,24 @@ func branchDatabaseTable(database tree.TableName, name string) tree.TableName {
 	return newQualifiedCloneTableName(database.ObjectName.String(), name, database.AtTsExpr)
 }
 
+// Catalog definitions are retained only for restore's read-only planning
+// phase. DIFF/MERGE enumeration keeps its existing name-only result.
+type branchDatabaseCatalog struct {
+	snapshot      *plan2.Snapshot
+	tables        map[string]bool
+	definitions   map[string]*plan.TableDef
+	relationOpens int
+}
+
 func branchDatabaseTables(ctx context.Context, ses *Session, bh BackgroundExec, endpoint tree.TableName) (map[string]bool, error) {
+	catalog, err := loadBranchDatabaseCatalog(ctx, ses, bh, endpoint, false)
+	if err != nil {
+		return nil, err
+	}
+	return catalog.tables, nil
+}
+
+func loadBranchDatabaseCatalog(ctx context.Context, ses *Session, bh BackgroundExec, endpoint tree.TableName, retainDefinitions bool) (*branchDatabaseCatalog, error) {
 	snapshot, err := resolveSnapshot(ses, endpoint.AtTsExpr)
 	if err != nil {
 		return nil, err
@@ -177,22 +196,36 @@ func branchDatabaseTables(ctx context.Context, ses *Session, bh BackgroundExec, 
 			return nil, err
 		}
 	}
+	return scanBranchDatabaseCatalog(ctx, db, snapshot, retainDefinitions)
+}
+
+func scanBranchDatabaseCatalog(ctx context.Context, db engine.Database, snapshot *plan2.Snapshot, retainDefinitions bool) (*branchDatabaseCatalog, error) {
 	names, err := db.Relations(ctx)
 	if err != nil {
 		return nil, err
 	}
-	result := make(map[string]bool, len(names))
+	result := &branchDatabaseCatalog{snapshot: snapshot, tables: make(map[string]bool, len(names))}
+	if retainDefinitions {
+		result.definitions = make(map[string]*plan.TableDef, len(names))
+	}
 	for _, table := range names {
+		if err = ctx.Err(); err != nil {
+			return nil, err
+		}
 		if strings.HasPrefix(table, catalog.PrefixIndexTableName) {
 			continue
 		}
+		result.relationOpens++
 		rel, err := db.Relation(ctx, table, nil)
 		if err != nil {
 			return nil, err
 		}
 		def := rel.GetTableDef(ctx)
 		if def.TableType == catalog.SystemOrdinaryRel || def.TableType == "" {
-			result[table] = true
+			result.tables[table] = true
+			if retainDefinitions {
+				result.definitions[table] = def
+			}
 		}
 	}
 	return result, nil
