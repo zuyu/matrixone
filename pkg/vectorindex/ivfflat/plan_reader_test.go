@@ -1605,6 +1605,9 @@ func TestRelationScannerUsesSnapshotCloneAndPublisherAccount(t *testing.T) {
 	original := mock_frontend.NewMockTxnOperator(ctrl)
 	clone := mock_frontend.NewMockTxnOperator(ctrl)
 	proc.Base.TxnOperator = original
+	stale := mock_frontend.NewMockTxnOperator(ctrl)
+	stale.EXPECT().Txn().Return(txn.TxnMeta{SnapshotTS: timestamp.Timestamp{PhysicalTime: 7}})
+	proc.SetCloneTxnOperator(stale)
 	snapshotTS := timestamp.Timestamp{PhysicalTime: 8}
 	original.EXPECT().Txn().Return(txn.TxnMeta{SnapshotTS: timestamp.Timestamp{PhysicalTime: 10}})
 	original.EXPECT().CloneSnapshotOp(snapshotTS).Return(clone)
@@ -1636,7 +1639,7 @@ func TestRelationScannerUsesSnapshotCloneAndPublisherAccount(t *testing.T) {
 	require.NoError(t, err)
 	_, err = reader.(*planReader).scanner.ScanRelation(sqlexec.RelationScanRequest{Schema: "db", Table: "entries"})
 	require.ErrorContains(t, err, "snapshot relation unavailable")
-	require.Same(t, clone, proc.GetCloneTxnOperator())
+	require.Same(t, stale, proc.GetCloneTxnOperator(), "a reader must not overwrite another scan's view")
 }
 
 func TestRelationScannerKeepsCurrentTxnForEqualAndAheadSnapshots(t *testing.T) {

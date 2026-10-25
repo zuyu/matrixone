@@ -2042,11 +2042,6 @@ func (s *Scope) buildReaders(c *Compile) (readers []engine.Reader, err error) {
 			if n.ScanSnapshot != nil && n.ScanSnapshot.TS != nil {
 				if !n.ScanSnapshot.TS.Equal(timestamp.Timestamp{LogicalTime: 0, PhysicalTime: 0}) &&
 					n.ScanSnapshot.TS.Less(c.proc.GetTxnOperator().Txn().SnapshotTS) {
-					if c.proc.GetCloneTxnOperator() == nil {
-						txnOp := c.proc.GetTxnOperator().CloneSnapshotOp(*n.ScanSnapshot.TS)
-						c.proc.SetCloneTxnOperator(txnOp)
-					}
-
 					if n.ScanSnapshot.Tenant != nil {
 						ctx = context.WithValue(ctx, defines.TenantIDKey{}, n.ScanSnapshot.Tenant.TenantID)
 					}

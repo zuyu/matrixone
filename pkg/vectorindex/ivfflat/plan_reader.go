@@ -736,12 +736,7 @@ func (s *relationScanner) ScanRelation(req sqlexec.RelationScanRequest) (res exe
 	} else if s.snapshot != nil && s.snapshot.TS != nil &&
 		(s.snapshot.TS.LogicalTime != 0 || s.snapshot.TS.PhysicalTime != 0) &&
 		s.snapshot.TS.Less(txn.Txn().SnapshotTS) {
-		clone := s.proc.GetCloneTxnOperator()
-		if clone == nil {
-			clone = txn.CloneSnapshotOp(*s.snapshot.TS)
-			s.proc.SetCloneTxnOperator(clone)
-		}
-		txn = clone
+		txn = s.proc.GetTxnOperatorForSnapshot(*s.snapshot.TS)
 	}
 	db, err := s.proc.GetSessionInfo().StorageEngine.Database(ctx, req.Schema, txn)
 	if err != nil {

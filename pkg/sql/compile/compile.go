@@ -5609,12 +5609,7 @@ func (c *Compile) getCompileTableScanDataSourceTxn(s *Scope) (client.TxnOperator
 	if node.ScanSnapshot != nil && node.ScanSnapshot.TS != nil {
 		if !node.ScanSnapshot.TS.Equal(timestamp.Timestamp{LogicalTime: 0, PhysicalTime: 0}) &&
 			node.ScanSnapshot.TS.Less(c.proc.GetTxnOperator().Txn().SnapshotTS) {
-			if c.proc.GetCloneTxnOperator() != nil {
-				txnOp = c.proc.GetCloneTxnOperator()
-			} else {
-				txnOp = c.proc.GetTxnOperator().CloneSnapshotOp(*node.ScanSnapshot.TS)
-				c.proc.SetCloneTxnOperator(txnOp)
-			}
+			txnOp = c.proc.GetTxnOperatorForSnapshot(*node.ScanSnapshot.TS)
 
 			if node.ScanSnapshot.Tenant != nil {
 				ctx = context.WithValue(ctx, defines.TenantIDKey{}, node.ScanSnapshot.Tenant.TenantID)
@@ -10770,11 +10765,6 @@ func collectTombstones(
 		zeroTS := timestamp.Timestamp{LogicalTime: 0, PhysicalTime: 0}
 		snapTS := c.proc.GetTxnOperator().Txn().SnapshotTS
 		if !node.ScanSnapshot.TS.Equal(zeroTS) && node.ScanSnapshot.TS.Less(snapTS) {
-			if c.proc.GetCloneTxnOperator() == nil {
-				txnOp := c.proc.GetTxnOperator().CloneSnapshotOp(*node.ScanSnapshot.TS)
-				c.proc.SetCloneTxnOperator(txnOp)
-			}
-
 			if node.ScanSnapshot.Tenant != nil {
 				ctx = context.WithValue(ctx, defines.TenantIDKey{}, node.ScanSnapshot.Tenant.TenantID)
 			}
@@ -10791,7 +10781,9 @@ func collectTombstones(
 	if util.TableIsLoggingTable(node.ObjRef.SchemaName, node.ObjRef.ObjName) {
 		ctx = defines.AttachAccountId(ctx, catalog.System_Account)
 	}
-	logCatalogSnapshotScan("compile.collect-tombstones", node, ctx, c.proc.GetCloneTxnOperator())
+	// The relation already owns its resolved read view. Logging must not
+	// create or replace another scan's snapshot transaction.
+	logCatalogSnapshotScan("compile.collect-tombstones", node, ctx, nil)
 
 	tombstone, err = rel.CollectTombstones(ctx, c.TxnOffset, policy)
 	if err != nil {
@@ -10903,12 +10895,7 @@ func (c *Compile) handleDbRelContext(node *plan.Node, onRemoteCN bool) (engine.R
 		if !node.ScanSnapshot.TS.Equal(timestamp.Timestamp{LogicalTime: 0, PhysicalTime: 0}) &&
 			node.ScanSnapshot.TS.Less(c.proc.GetTxnOperator().Txn().SnapshotTS) {
 
-			if c.proc.GetCloneTxnOperator() != nil {
-				txnOp = c.proc.GetCloneTxnOperator()
-			} else {
-				txnOp = c.proc.GetTxnOperator().CloneSnapshotOp(*node.ScanSnapshot.TS)
-				c.proc.SetCloneTxnOperator(txnOp)
-			}
+			txnOp = c.proc.GetTxnOperatorForSnapshot(*node.ScanSnapshot.TS)
 
 			if node.ScanSnapshot.Tenant != nil {
 				ctx = context.WithValue(ctx, defines.TenantIDKey{}, node.ScanSnapshot.Tenant.TenantID)

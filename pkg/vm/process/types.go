@@ -1022,6 +1022,17 @@ func (proc *Process) GetCloneTxnOperator() client.TxnOperator {
 	return proc.Base.CloneTxnOperator
 }
 
+// GetTxnOperatorForSnapshot must not reuse a clone belonging to another
+// scan timestamp. A single query can join multiple historical versions.
+// Additional views stay local to their readers instead of overwriting the
+// process-wide legacy clone slot shared by concurrent pipelines.
+func (proc *Process) GetTxnOperatorForSnapshot(snapshot timestamp.Timestamp) client.TxnOperator {
+	if clone := proc.GetCloneTxnOperator(); clone != nil && clone.Txn().SnapshotTS.Equal(snapshot) {
+		return clone
+	}
+	return proc.GetTxnOperator().CloneSnapshotOp(snapshot)
+}
+
 func (proc *Process) GetTxnOperator() client.TxnOperator {
 	return proc.Base.TxnOperator
 }
