@@ -47,6 +47,8 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 		{name: "native_update", ops: []batchWithKind{oldUpdate, native}},
 		{name: "restore_deleted_target", ops: []batchWithKind{oldUpdate, restore}},
 		{name: "repeated_flush", ops: []batchWithKind{insert, update, del, insert, update, del}, want: []string{"upd", "del"}},
+		{name: "clear_update_failure", ops: []batchWithKind{update, insert, update}, want: []string{"upd"}, failure: "clear"},
+		{name: "clear_delete_failure", ops: []batchWithKind{del, update, del}, want: []string{"del", "upd"}, failure: "clear"},
 		{name: "keyless_insert", ops: []batchWithKind{insert}, fakePK: true},
 		{name: "keyless_update", ops: []batchWithKind{oldUpdate, update}, want: []string{"del"}, fakePK: true},
 		{name: "first_create_failure", ops: []batchWithKind{insert, update}, want: []string{"upd"}, failure: "create_first"},
@@ -72,7 +74,8 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 			injected := errors.New("injected " + tc.failure)
 			cleanupErr := errors.New("cleanup error")
 			created, dropped, loads := map[string]int{}, map[string]int{}, map[string]int{}
-			ready := map[string]bool{}
+			ready, dirty := map[string]bool{}, map[string]bool{}
+			clears := map[string]int{}
 			stageName := regexp.MustCompile("__mo_diff_(del|ins|upd)_[^` ]+")
 			createCalls := 0
 			bh := mock_frontend.NewMockBackgroundExec(ctrl)
@@ -100,6 +103,7 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 				case strings.HasPrefix(sql, "drop table"):
 					dropped[kind]++
 					delete(ready, table)
+					delete(dirty, table)
 					if dropped[kind] == 2 {
 						if tc.failure == "cleanup" {
 							return injected
@@ -110,7 +114,17 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 					}
 				default:
 					require.True(t, ready[table], "stage DDL must precede DML: %s", sql)
-					if strings.HasPrefix(sql, "insert into") {
+					if strings.HasPrefix(sql, "delete from "+qualifiedTableName("db1", table)) {
+						require.True(t, dirty[table], "fresh stages must not be cleared")
+						clears[kind]++
+						if tc.failure == "clear" {
+							return injected
+						}
+						dirty[table] = false
+					}
+					if strings.HasPrefix(sql, "insert into "+qualifiedTableName("db1", table)) {
+						require.False(t, dirty[table], "old rows must be cleared before the next load")
+						dirty[table] = true
 						loads[kind]++
 						if strings.HasPrefix(tc.failure, "apply") {
 							return injected
@@ -167,6 +181,20 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 				require.Equal(t, 2, dropped[kind], "one initial DROP and one cleanup for %s", kind)
 			}
 			require.Empty(t, ready)
+			require.Empty(t, dirty)
+			if tc.failure == "" {
+				for _, kind := range tc.want {
+					require.Equal(t, max(0, loads[kind]-1), clears[kind], "no final clear for %s", kind)
+				}
+			}
+			if tc.failure == "clear" {
+				kind := "upd"
+				if tc.name == "clear_delete_failure" {
+					kind = "del"
+				}
+				require.Equal(t, 1, clears[kind])
+				require.Equal(t, 1, loads[kind], "a failed clear must prevent the next load")
+			}
 			if tc.name == "repeated_flush" {
 				require.GreaterOrEqual(t, loads["direct"], 2)
 				require.GreaterOrEqual(t, loads["upd"], 2)

@@ -161,6 +161,9 @@ type applyBatchInfo struct {
 	// Online MERGE prepares each stage at its first nonempty flush. Other
 	// consumers (PICK and portable SQL output) keep eager initialization.
 	prepareStage func(kind string) error
+	// The MERGE owner clears UPDATE/DELETE stages before their next load,
+	// allowing the final contents to be reclaimed by DROP without a DELETE.
+	clearStageBeforeReuse bool
 }
 
 func (batchInfo *applyBatchInfo) ensureStage(kind string) error {
@@ -443,9 +446,10 @@ func mergeDiffs(
 	var stages []string
 	ready := make(map[string]bool, 3)
 	if appender.batchInfo != nil {
+		appender.batchInfo.clearStageBeforeReuse = true
 		appender.batchInfo.prepareStage = func(kind string) error {
 			if ready[kind] {
-				return nil
+				return clearApplyStage(ctx, ses, bh, appender.batchInfo, appender.writeFile, kind)
 			}
 			stages = append(stages, kind)
 			if err := timing.measure("stage_init", func() error {
@@ -3074,6 +3078,25 @@ func dropApplyTables(
 	return execRetryableSQLStatements(ctx, ses, bh, writeFile, stmts)
 }
 
+// Clear only on reuse: a successful final batch is followed directly by DROP.
+// Keep the statement executor and owner transaction used by the apply SQL.
+func clearApplyStage(
+	ctx context.Context, ses *Session, bh BackgroundExec,
+	batchInfo *applyBatchInfo, writeFile func([]byte) error, kind string,
+) error {
+	var name string
+	switch kind {
+	case diffDelete:
+		name = batchInfo.deleteTable
+	case diffUpdate:
+		name = batchInfo.updateTable
+	default:
+		return moerr.NewInternalErrorNoCtxf("invalid reusable MERGE stage %q", kind)
+	}
+	sql := fmt.Sprintf("delete from %s", qualifiedTableName(batchInfo.dbName, name))
+	return execRetryableSQLStatements(ctx, ses, bh, writeFile, []string{sql})
+}
+
 func flushStagedUpdateValues(
 	ctx context.Context,
 	ses *Session,
@@ -3110,7 +3133,9 @@ func flushStagedUpdateValues(
 		stmts = append(stmts, updateStmt)
 	}
 	stmts = append(stmts, specialUpdateStmts...)
-	stmts = append(stmts, clearStmt)
+	if !batchInfo.clearStageBeforeReuse {
+		stmts = append(stmts, clearStmt)
+	}
 	return execRetryableSQLStatements(ctx, ses, bh, writeFile, stmts)
 }
 
@@ -3167,8 +3192,11 @@ func flushSqlValues(
 			if err := batchInfo.ensureStage(diffDelete); err != nil {
 				return err
 			}
-			clearStmt := fmt.Sprintf("delete from %s", deleteTable)
-			return execRetryableSQLStatements(ctx, ses, bh, writeFile, []string{insertStmt, deleteStmt, clearStmt})
+			stmts := []string{insertStmt, deleteStmt}
+			if !batchInfo.clearStageBeforeReuse {
+				stmts = append(stmts, fmt.Sprintf("delete from %s", deleteTable))
+			}
+			return execRetryableSQLStatements(ctx, ses, bh, writeFile, stmts)
 		}
 
 		if batchInfo.directInsert && !batchInfo.disableInsertStage {
