@@ -3368,8 +3368,8 @@ func buildFakePKInsertBatchWithoutFakePKValue(t *testing.T, mp *mpool.MPool, row
 }
 
 func TestOnlineBranchApplyOrdersPreparationProductionAndCleanup(t *testing.T) {
-	for _, mode := range []struct{ pick, lazy bool }{{}, {lazy: true}, {pick: true}} {
-		pick, lazy := mode.pick, mode.lazy
+	for _, pick := range []bool{false, true} {
+		lazy := !pick
 		for _, failure := range []string{"", "empty", "init", "producer", "apply", "cancel"} {
 			t.Run(fmt.Sprintf("pick=%v/lazy=%v/%s", pick, lazy, failure), func(t *testing.T) {
 				ses := newValidateSession(t)
@@ -3387,7 +3387,7 @@ func TestOnlineBranchApplyOrdersPreparationProductionAndCleanup(t *testing.T) {
 				bh.EXPECT().Exec(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, sql string) error {
 					events = append(events, sql)
 					if strings.HasPrefix(sql, "create table") {
-						require.Equal(t, lazy, produced, "only a serial summary producer may defer stage initialization")
+						require.Equal(t, lazy, produced, "MERGE prepares stages during serial production or final flush")
 						creates++
 						if failure == "init" {
 							return injected
@@ -3439,21 +3439,16 @@ func TestOnlineBranchApplyOrdersPreparationProductionAndCleanup(t *testing.T) {
 					err = pickMergeDiffs(ctx, cancel, ses, bh, &tree.DataBranchPick{ConflictOpt: &tree.ConflictOpt{Opt: tree.CONFLICT_ACCEPT}}, tblStuff, produce)
 				} else {
 					timing := &dataBranchMergeTiming{now: time.Now, phases: make(map[string]time.Duration)}
-					err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce, lazy, timing)
-					if failure == "empty" && lazy {
+					err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce, timing)
+					if creates == 0 {
 						require.Zero(t, timing.phases["stage_init"])
-						require.Zero(t, timing.phases["apply"])
 						require.Zero(t, timing.phases["stage_cleanup"])
 					} else {
 						require.Positive(t, timing.phases["stage_init"])
-						if failure != "init" {
-							require.Positive(t, timing.phases["stage_cleanup"])
-						}
+						require.Positive(t, timing.phases["stage_cleanup"])
 					}
-					if failure != "init" || lazy {
-						require.Positive(t, timing.phases["diff"])
-					}
-					if failure == "" || failure == "apply" {
+					require.Positive(t, timing.phases["diff"])
+					if failure != "empty" {
 						require.Positive(t, timing.phases["apply"])
 					}
 				}
@@ -3467,8 +3462,8 @@ func TestOnlineBranchApplyOrdersPreparationProductionAndCleanup(t *testing.T) {
 				}
 				if failure == "init" {
 					require.Equal(t, lazy, produced)
-				} else if failure == "empty" && lazy {
-					require.Empty(t, events, "an empty summary must not create or drop stages")
+				} else if lazy && creates == 0 {
+					require.Empty(t, events, "unflushed buffers must not create or drop stages")
 				} else {
 					require.True(t, strings.HasPrefix(events[len(events)-1], "drop table if exists"), "cleanup runs after production returns")
 				}

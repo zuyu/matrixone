@@ -1215,7 +1215,7 @@ func diffMergeWithExecutor(ses *Session, execCtx *ExecCtx, stmt tree.Statement,
 		if pickStmt != nil {
 			return pickMergeDiffs(ctx, cancel, ses, bh, pickStmt, tblStuff, produce)
 		}
-		if err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce, summary != nil, timing); err != nil {
+		if err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce, timing); err != nil {
 			return err
 		}
 		if summary != nil && summarySink == nil {

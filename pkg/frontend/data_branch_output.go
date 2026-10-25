@@ -154,6 +154,16 @@ type applyBatchInfo struct {
 	updateValueIdxes       []int
 	disableInsertStage     bool
 	insertRowsIndividually bool
+	// Online MERGE prepares each stage at its first nonempty flush. Other
+	// consumers (PICK and portable SQL output) keep eager initialization.
+	prepareStage func(kind string) error
+}
+
+func (batchInfo *applyBatchInfo) ensureStage(kind string) error {
+	if batchInfo.prepareStage != nil {
+		return batchInfo.prepareStage(kind)
+	}
+	return nil
 }
 
 func newSQLValuesAppender(
@@ -388,7 +398,6 @@ func mergeDiffs(
 	bh BackgroundExec,
 	tblStuff tableStuff,
 	produce func(emitFunc) error,
-	lazyInit bool,
 	timings ...*dataBranchMergeTiming,
 ) (err error) {
 	var timing *dataBranchMergeTiming
@@ -420,34 +429,36 @@ func mergeDiffs(
 		&deleteCnt, deleteFromVals, &insertCnt, insertIntoVals, nil,
 	)
 
-	initialized := false
-	initialize := func() error {
-		if err := timing.measure("stage_init", func() error {
-			return initApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile)
-		}); err != nil {
-			return err
-		}
-		initialized = true
-		return nil
-	}
-	if !lazyInit {
-		if err = initialize(); err != nil {
-			return err
+	// The serial apply owner creates a stage only when a nonempty buffer
+	// actually uses it. Record an attempted stage before DDL, so cleanup also
+	// covers a partial initialization failure; the owner still rolls back.
+	var stages []string
+	ready := make(map[string]bool, 3)
+	if appender.batchInfo != nil {
+		appender.batchInfo.prepareStage = func(kind string) error {
+			if ready[kind] {
+				return nil
+			}
+			stages = append(stages, kind)
+			if err := timing.measure("stage_init", func() error {
+				return initApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile, kind)
+			}); err != nil {
+				return err
+			}
+			ready[kind] = true
+			return nil
 		}
 	}
 	defer func() {
-		if initialized {
+		if len(stages) > 0 {
 			if err2 := timing.measure("stage_cleanup", func() error {
-				return dropApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile)
+				return dropApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile, stages...)
 			}); err2 != nil && err == nil {
 				err = err2
 			}
 		}
 	}()
 
-	// Summary matching can eliminate every source change. Its serial
-	// owner delays stage DDL until the first nonempty apply batch, so a
-	// no-op still needs no stages. Ordinary MERGE keeps eager preparation.
 	// Successful delivery transfers the batch; emitBatch releases failures.
 	if err = timing.produce(produce, func(wrapped batchWithKind) (bool, error) {
 		if err := ctx.Err(); err != nil {
@@ -458,12 +469,7 @@ func mergeDiffs(
 			tblStuff.retPool.releaseRetBatch(wrapped.batch, false)
 			return false, nil
 		}
-		if !initialized {
-			if err := initialize(); err != nil {
-				return false, err
-			}
-		}
-		if err := timing.measure("apply", func() error {
+		if err := timing.apply(func() error {
 			return appendBatchRowsAsSQLValues(ctx, ses, tblStuff, wrapped, tmpValsBuffer, appender)
 		}); err != nil {
 			return false, err
@@ -473,10 +479,10 @@ func mergeDiffs(
 	}); err != nil {
 		return err
 	}
-	if !initialized {
+	if deleteCnt == 0 && insertCnt == 0 && appender.updateState.cnt == 0 {
 		return nil
 	}
-	return timing.measure("apply", appender.flushAll)
+	return timing.apply(appender.flushAll)
 }
 
 // resolveProjectedIdxes resolves the user-specified COLUMNS list to the
@@ -2949,6 +2955,7 @@ func initApplyTables(
 	bh BackgroundExec,
 	batchInfo *applyBatchInfo,
 	writeFile func([]byte) error,
+	kinds ...string,
 ) error {
 	if batchInfo == nil {
 		return nil
@@ -2986,17 +2993,31 @@ func initApplyTables(
 	}
 	updateCols := strings.Join(updateSelectExprs, ",")
 
-	stmts := []string{
-		fmt.Sprintf("drop table if exists %s", deleteTable),
-		fmt.Sprintf("create table %s as select %s from %s where 1=0", deleteTable, deleteCols, baseTable),
+	if len(kinds) == 0 {
+		kinds = []string{diffDelete, diffInsert, diffUpdate}
 	}
-	if !batchInfo.disableInsertStage {
+	var stmts []string
+	for _, kind := range kinds {
+		var table, columns string
+		switch kind {
+		case diffDelete:
+			table, columns = deleteTable, deleteCols
+		case diffInsert:
+			if batchInfo.disableInsertStage {
+				continue
+			}
+			table, columns = insertTable, insertCols
+		case diffUpdate:
+			if batchInfo.disableInsertStage {
+				continue
+			}
+			table, columns = updateTable, updateCols
+		default:
+			return moerr.NewInternalErrorNoCtxf("invalid Data Branch apply stage %q", kind)
+		}
 		stmts = append(stmts,
-			fmt.Sprintf("drop table if exists %s", insertTable),
-			fmt.Sprintf("create table %s as select %s from %s where 1=0", insertTable, insertCols, baseTable),
-			fmt.Sprintf("drop table if exists %s", updateTable),
-			fmt.Sprintf("create table %s as select %s from %s where 1=0", updateTable, updateCols, baseTable),
-		)
+			fmt.Sprintf("drop table if exists %s", table),
+			fmt.Sprintf("create table %s as select %s from %s where 1=0", table, columns, baseTable))
 	}
 
 	return execRetryableSQLStatements(ctx, ses, bh, writeFile, stmts)
@@ -3008,6 +3029,7 @@ func dropApplyTables(
 	bh BackgroundExec,
 	batchInfo *applyBatchInfo,
 	writeFile func([]byte) error,
+	kinds ...string,
 ) error {
 	if batchInfo == nil {
 		return nil
@@ -3017,14 +3039,29 @@ func dropApplyTables(
 	insertTable := qualifiedTableName(batchInfo.dbName, batchInfo.insertTable)
 	updateTable := qualifiedTableName(batchInfo.dbName, batchInfo.updateTable)
 
-	stmts := []string{
-		fmt.Sprintf("drop table if exists %s", deleteTable),
+	if len(kinds) == 0 {
+		kinds = []string{diffDelete, diffInsert, diffUpdate}
 	}
-	if !batchInfo.disableInsertStage {
-		stmts = append(stmts,
-			fmt.Sprintf("drop table if exists %s", insertTable),
-			fmt.Sprintf("drop table if exists %s", updateTable),
-		)
+	var stmts []string
+	for _, kind := range kinds {
+		var table string
+		switch kind {
+		case diffDelete:
+			table = deleteTable
+		case diffInsert:
+			if batchInfo.disableInsertStage {
+				continue
+			}
+			table = insertTable
+		case diffUpdate:
+			if batchInfo.disableInsertStage {
+				continue
+			}
+			table = updateTable
+		default:
+			return moerr.NewInternalErrorNoCtxf("invalid Data Branch apply stage %q", kind)
+		}
+		stmts = append(stmts, fmt.Sprintf("drop table if exists %s", table))
 	}
 	return execRetryableSQLStatements(ctx, ses, bh, writeFile, stmts)
 }
@@ -3052,6 +3089,9 @@ func flushStagedUpdateValues(
 	insertStmt := fmt.Sprintf("insert into %s values %s", updateTable, values)
 	updateStmt, err := batchInfo.stagedUpdateSQL(baseTable, updateTable)
 	if err != nil {
+		return err
+	}
+	if err := batchInfo.ensureStage(diffUpdate); err != nil {
 		return err
 	}
 	specialUpdateStmts := batchInfo.stagedSpecialUpsertSQL(baseTable, updateTable)
@@ -3116,11 +3156,17 @@ func flushSqlValues(
 			if err != nil {
 				return err
 			}
+			if err := batchInfo.ensureStage(diffDelete); err != nil {
+				return err
+			}
 			clearStmt := fmt.Sprintf("delete from %s", deleteTable)
 			return execRetryableSQLStatements(ctx, ses, bh, writeFile, []string{insertStmt, deleteStmt, clearStmt})
 		}
 
 		if !batchInfo.disableInsertStage {
+			if err := batchInfo.ensureStage(diffInsert); err != nil {
+				return err
+			}
 			insertStmt := fmt.Sprintf("insert into %s values %s", insertTable, buf.String())
 			cols := joinQuotedColumnNames(batchInfo.writableNames)
 			applyStmt := fmt.Sprintf(

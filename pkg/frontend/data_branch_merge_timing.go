@@ -68,6 +68,19 @@ func (t *dataBranchMergeTiming) measure(phase string, fn func() error) error {
 	return fn()
 }
 
+// A first flush can prepare its stage inside apply. Charge that DDL only to
+// stage_init, including when it fails or panics, to keep exclusive wall times.
+func (t *dataBranchMergeTiming) apply(fn func() error) error {
+	if t == nil {
+		return fn()
+	}
+	start, stageBefore := t.now(), t.phases["stage_init"]
+	defer func() {
+		t.phases["apply"] += max(time.Duration(0), t.now().Sub(start)-(t.phases["stage_init"]-stageBefore))
+	}()
+	return fn()
+}
+
 // The producer includes synchronous callbacks that initialize stages and apply
 // rows. Subtract their complete duration so diff does not count that work again.
 func (t *dataBranchMergeTiming) produce(produce func(emitFunc) error, emit emitFunc) error {
