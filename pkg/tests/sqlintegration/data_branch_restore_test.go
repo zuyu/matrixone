@@ -129,3 +129,97 @@ func TestDataBranchDatabaseResetRevert(t *testing.T) {
 		require.Zero(t, stages)
 	})
 }
+
+func TestDataBranchRestoreEmptyStages(t *testing.T) {
+	runSQLIntegration(t, func(c embed.Cluster) {
+		cn, err := c.GetCNService(0)
+		require.NoError(t, err)
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+		defer cancel()
+		db, err := sql.Open("mysql", fmt.Sprintf("dump:111@tcp(127.0.0.1:%d)/", cn.GetServiceConfig().CN.Frontend.Port))
+		require.NoError(t, err)
+		defer db.Close()
+		db.SetMaxOpenConns(1)
+		for _, operation := range []string{"reset", "revert"} {
+			t.Run(operation, func(t *testing.T) {
+				name := "restore_empty_" + operation
+				q := func(sql string) { execSQLRequire(t, ctx, db, fmt.Sprintf(sql, name)) }
+				q("create database %[1]s")
+				defer cleanupSQLIntegration(t, cn, "drop database if exists "+name)
+				q("create table %[1]s.heap(v int)")
+				q("create table %[1]s.keys_only(id decimal(38,0) primary key)")
+				q("insert into %[1]s.keys_only values(123456789012345678901234567890)")
+				q("create table %[1]s.typed(a int,b varchar(20),v decimal(38,0),raw varbinary(10),n varchar(20),primary key(a,b))")
+				q("insert into %[1]s.typed values(1,'quote''key',123456789012345678901234567890,x'00ff',NULL),(2,'b',NULL,x'abcd','keep')")
+				q("create snapshot %[1]s_before for database %[1]s")
+				defer q("drop snapshot %[1]s_before")
+				var heapID uint64
+				require.NoError(t, db.QueryRowContext(ctx, "select rel_id from mo_catalog.mo_tables where reldatabase=? and relname='heap'", name).Scan(&heapID))
+				q("insert into %[1]s.heap values(1),(1)")
+				q("delete from %[1]s.keys_only where true")
+				q("insert into %[1]s.keys_only values(2)")
+				q("update %[1]s.typed set v=NULL,raw=x'00',n='new' where a=1")
+				q("delete from %[1]s.typed where a=2")
+				q("insert into %[1]s.typed values(3,'c',3,x'33','new')")
+				q("create snapshot %[1]s_after for database %[1]s")
+				defer q("drop snapshot %[1]s_after")
+				restore := fmt.Sprintf("data branch reset database %[1]s from %[1]s{snapshot='%[1]s_before'}", name)
+				if operation == "revert" {
+					restore = fmt.Sprintf("data branch revert database %[1]s from %[1]s{snapshot='%[1]s_after'} against %[1]s{snapshot='%[1]s_before'} tables(keys_only,typed)", name)
+					q("insert into %[1]s.typed values(4,'later',4,x'44','later')")
+				}
+				verify := func(restored bool) {
+					var key string
+					require.NoError(t, db.QueryRowContext(ctx, "select cast(id as char) from "+name+".keys_only").Scan(&key))
+					if restored {
+						require.Equal(t, "123456789012345678901234567890", key)
+					} else {
+						require.Equal(t, "2", key)
+					}
+					var value, raw, nullable sql.NullString
+					require.NoError(t, db.QueryRowContext(ctx, "select cast(v as char),hex(raw),n from "+name+".typed where a=1").Scan(&value, &raw, &nullable))
+					if restored {
+						require.Equal(t, sql.NullString{String: "123456789012345678901234567890", Valid: true}, value)
+						require.Equal(t, "00FF", raw.String)
+						require.False(t, nullable.Valid)
+					} else {
+						require.False(t, value.Valid)
+						require.Equal(t, "new", nullable.String)
+					}
+					var count, heapCount int
+					require.NoError(t, db.QueryRowContext(ctx, "select count(*) from "+name+".typed").Scan(&count))
+					if operation == "revert" {
+						require.Equal(t, 3, count)
+					} else {
+						require.Equal(t, 2, count)
+					}
+					require.NoError(t, db.QueryRowContext(ctx, "select count(*) from "+name+".heap").Scan(&heapCount))
+					if restored && operation == "reset" {
+						require.Zero(t, heapCount)
+					} else {
+						require.Equal(t, 2, heapCount)
+					}
+					var id uint64
+					require.NoError(t, db.QueryRowContext(ctx, "select rel_id from mo_catalog.mo_tables where reldatabase=? and relname='heap'", name).Scan(&id))
+					require.Equal(t, heapID, id)
+					require.NoError(t, db.QueryRowContext(ctx, "select count(*) from mo_catalog.mo_tables where reldatabase=? and relname like '__mo_branch_restore_%'", name).Scan(&count))
+					require.Zero(t, count)
+				}
+				execSQLRequire(t, ctx, db, "begin")
+				execSQLRequire(t, ctx, db, restore)
+				verify(true)
+				execSQLRequire(t, ctx, db, "rollback")
+				verify(false)
+				execSQLRequire(t, ctx, db, restore)
+				verify(true)
+				// Repeated RESET has empty stages; repeated REVERT is idempotent.
+				execSQLRequire(t, ctx, db, restore)
+				verify(true)
+				if operation == "revert" {
+					execSQLRequire(t, ctx, db, fmt.Sprintf("data branch revert database %[1]s from %[1]s{snapshot='%[1]s_before'} against %[1]s{snapshot='%[1]s_before'} tables(keys_only,typed)", name))
+					verify(true)
+				}
+			})
+		}
+	})
+}

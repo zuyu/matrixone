@@ -12,7 +12,6 @@ package frontend
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -29,6 +28,7 @@ type branchRestorePlan struct {
 	columns, keys           []string
 	rowsTable, deletesTable string
 	rowsQuery, deletesQuery string
+	rowsEmpty, deletesEmpty bool
 }
 
 // RESET restores data without replacing relation identities. REVERT applies
@@ -112,35 +112,7 @@ func handleBranchRestore(execCtx *ExecCtx, ses *Session, stmt *tree.DataBranchDa
 		}
 		plans = append(plans, p)
 	}
-	var stages []string
-	defer func() {
-		for i := len(stages) - 1; i >= 0; i-- {
-			if cleanupErr := bh.Exec(ctx, "drop table if exists "+stages[i]); cleanupErr != nil {
-				err = errors.Join(err, cleanupErr)
-			}
-		}
-	}()
-	// Materialize every delta before writing any destination. The temporary
-	// relations also avoid MySQL's same-table DELETE snapshot subquery limit.
-	for _, p := range plans {
-		for _, stage := range [][2]string{{p.rowsTable, p.rowsQuery}, {p.deletesTable, p.deletesQuery}} {
-			if stage[1] == "" {
-				continue
-			}
-			if err = bh.Exec(ctx, "create table "+stage[0]+" as "+stage[1]); err != nil {
-				return err
-			}
-			stages = append(stages, stage[0])
-		}
-	}
-	for _, p := range plans {
-		for _, sql := range p.applySQL() {
-			if err = bh.Exec(ctx, sql); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return executeBranchRestorePlans(ctx, bh, plans, stmt.Operation)
 }
 
 func branchRestoreTableSQL(table tree.TableName) string {
@@ -279,11 +251,20 @@ func (p branchRestorePlan) applySQL() []string {
 	if len(p.keys) == 0 {
 		// A WHERE clause keeps this as row DML; an unrestricted DELETE is
 		// optimized into TRUNCATE, which replaces identity and breaks lineage.
-		return []string{"delete from " + p.destination + " where true",
-			fmt.Sprintf("insert into %s (%s) select %s from %s", p.destination, columns, columns, p.rowsTable)}
+		sqls := []string{"delete from " + p.destination + " where true"}
+		if !p.rowsEmpty {
+			sqls = append(sqls, fmt.Sprintf("insert into %s (%s) select %s from %s", p.destination, columns, columns, p.rowsTable))
+		}
+		return sqls
 	}
 	join := branchRestoreJoin("d", "s", p.keys)
-	sqls := []string{fmt.Sprintf("delete d from %s d inner join %s s on %s", p.destination, p.deletesTable, join)}
+	var sqls []string
+	if !p.deletesEmpty {
+		sqls = append(sqls, fmt.Sprintf("delete d from %s d inner join %s s on %s", p.destination, p.deletesTable, join))
+	}
+	if p.rowsEmpty {
+		return sqls
+	}
 	var assignments []string
 	for _, name := range p.columns {
 		if slices.Contains(p.keys, name) {
