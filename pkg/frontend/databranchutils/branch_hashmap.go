@@ -108,7 +108,8 @@ type ShardCursor interface {
 	// ForEach visits every encoded key stored inside the shard, including rows
 	// that have spilled to disk. The callback is invoked per entry with a single
 	// payload row. The provided slices reference internal buffers (or scratch
-	// copies for spilled data) and are only valid inside the callback.
+	// copies for spilled data) and are only valid inside the callback. Copy
+	// slices needed after a mutation that removes their backing entry.
 	ForEach(fn func(key []byte, row []byte) error) error
 	// GetByEncodedKey retrieves rows using a pre-encoded key while the caller
 	// still owns the iteration lock.

@@ -3052,6 +3052,7 @@ func buildHashmapForTable(
 			maxIdx  int
 			tuple   types.Tuple
 			dataRet databranchutils.GetResult
+			keyBuf  []byte
 		)
 		if err2 = cursor.ForEach(func(key []byte, _ []byte) error {
 			select {
@@ -3059,6 +3060,12 @@ func buildHashmapForTable(
 				return ctx.Err()
 			default:
 			}
+			// The cursor key borrows the current tombstone's entry block.
+			// Removing an older version below may free that block before the
+			// data lookup and final tombstone removal. Keep one reusable key
+			// buffer per shard so those lookups cannot read released memory.
+			keyBuf = append(keyBuf[:0], key...)
+			key = keyBuf
 			var tombstoneRet databranchutils.GetResult
 			if tombstoneRet, err3 = cursor.GetByEncodedKey(key); err3 != nil {
 				return err3
