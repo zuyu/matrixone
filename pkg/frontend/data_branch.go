@@ -984,11 +984,11 @@ func diffMergeAgency(ses *Session, execCtx *ExecCtx, stmt tree.Statement) (err e
 	if deferred != nil {
 		defer finishDataBranchComponent(execCtx.reqCtx, timing.wrapFinish(deferred), &err)
 	}
-	return diffMergeWithExecutor(ses, execCtx, stmt, bh, nil, timing)
+	return diffMergeWithExecutor(ses, execCtx, stmt, bh, nil, nil, timing)
 }
 
 func diffMergeWithExecutor(ses *Session, execCtx *ExecCtx, stmt tree.Statement,
-	bh BackgroundExec, summarySink *dataBranchMergeSummary,
+	bh BackgroundExec, summarySink *dataBranchMergeSummary, dagCache *dataBranchDAGCache,
 	timings ...*dataBranchMergeTiming,
 ) (err error) {
 	var timing *dataBranchMergeTiming
@@ -1083,7 +1083,7 @@ func diffMergeWithExecutor(ses *Session, execCtx *ExecCtx, stmt tree.Statement,
 
 	if err = timing.measure("lineage", func() error {
 		var lineageErr error
-		dagInfo, lineageErr = decideLCABranchTSFromBranchDAG(ctx, ses, bh, tblStuff)
+		dagInfo, lineageErr = decideLCABranchTSFromBranchDAG(ctx, ses, bh, tblStuff, dagCache)
 		return lineageErr
 	}); err != nil {
 		return
@@ -3785,6 +3785,7 @@ func decideLCABranchTSFromBranchDAG(
 	ses *Session,
 	bh BackgroundExec,
 	tblStuff tableStuff,
+	dagCache *dataBranchDAGCache,
 ) (
 	branchInfo branchMetaInfo,
 	err error,
@@ -3793,7 +3794,7 @@ func decideLCABranchTSFromBranchDAG(
 	tarTableID := tblStuff.tarRel.GetTableID(ctx)
 	baseTableID := tblStuff.baseRel.GetTableID(ctx)
 
-	dag, err := constructBranchDAG(ctx, ses, bh)
+	dag, err := dagCache.get(ctx, ses, bh)
 	if err != nil {
 		return
 	}

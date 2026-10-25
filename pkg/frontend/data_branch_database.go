@@ -115,6 +115,9 @@ func handleBranchDatabase(execCtx *ExecCtx, ses *Session, stmt *tree.DataBranchD
 	}); err != nil {
 		return err
 	}
+	// The private owner already holds the lineage lifecycle gate. Reuse
+	// only within this statement's serial table loop, after authorization.
+	dagCache := newDataBranchDAGCache(ses.proc.GetTxnOperator().TxnOptions().ByBegin)
 	results := make([]branchDatabaseResult, 0, len(names))
 	for _, name := range names {
 		if err = ctx.Err(); err != nil {
@@ -129,14 +132,14 @@ func handleBranchDatabase(execCtx *ExecCtx, ses *Session, stmt *tree.DataBranchD
 			summary.source[0], err = branchDatabaseRowCount(ctx, bh, src)
 		case stmt.Operation == "diff":
 			diff := &tree.DataBranchDiff{TargetTable: src, BaseTable: dst}
-			err = diffMergeWithExecutor(ses, execCtx, diff, bh, summary)
+			err = diffMergeWithExecutor(ses, execCtx, diff, bh, summary, dagCache)
 		default:
 			policy := stmt.ConflictOpt
 			if policy == nil {
 				policy = &tree.ConflictOpt{Opt: tree.CONFLICT_FAIL}
 			}
 			merge := &tree.DataBranchMerge{SrcTable: src, DstTable: dst, ConflictOpt: policy, OutputSummary: true}
-			err = diffMergeWithExecutor(ses, execCtx, merge, bh, summary, timing)
+			err = diffMergeWithExecutor(ses, execCtx, merge, bh, summary, dagCache, timing)
 		}
 		summary.releaseKeys()
 		if err != nil {
