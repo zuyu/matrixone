@@ -471,6 +471,8 @@ func handleDataBranch(
 		return stats, dataBranchDeleteTable(execCtx, ses, st)
 	case *tree.DataBranchDeleteDatabase:
 		return stats, dataBranchDeleteDatabase(execCtx, ses, st)
+	case *tree.DataBranchDatabase:
+		return stats, handleBranchDatabase(execCtx, ses, st)
 	case *tree.DataBranchDiff:
 		return stats, handleBranchDiff(execCtx, ses, st)
 	case *tree.DataBranchMerge:
@@ -956,21 +958,28 @@ func dataBranchDeleteDatabase(
 	return nil
 }
 
-func diffMergeAgency(
-	ses *Session,
-	execCtx *ExecCtx,
-	stmt tree.Statement,
-) (err error) {
-
-	var (
-		bh       BackgroundExec
-		deferred func(error) error
-	)
-
+func diffMergeAgency(ses *Session, execCtx *ExecCtx, stmt tree.Statement) (err error) {
 	if err = validate(execCtx.reqCtx, ses, stmt); err != nil {
 		return err
 	}
+	// Enter the lineage-owner lifecycle before resolving endpoints or staging.
+	bh, deferred, err := getDataBranchMutationExecutor(execCtx.reqCtx, ses, false,
+		&BackgroundExecOption{forcePessimisticRC: true})
+	if err != nil {
+		return err
+	}
+	if deferred != nil {
+		defer finishDataBranchComponent(execCtx.reqCtx, deferred, &err)
+	}
+	return diffMergeWithExecutor(ses, execCtx, stmt, bh, nil)
+}
 
+func diffMergeWithExecutor(ses *Session, execCtx *ExecCtx, stmt tree.Statement,
+	bh BackgroundExec, summarySink *dataBranchMergeSummary,
+) (err error) {
+	if err = validate(execCtx.reqCtx, ses, stmt); err != nil {
+		return err
+	}
 	var (
 		dagInfo   branchMetaInfo
 		tblStuff  tableStuff
@@ -980,30 +989,12 @@ func diffMergeAgency(
 		mergeStmt *tree.DataBranchMerge
 		pickStmt  *tree.DataBranchPick
 	)
-
 	if diffStmt, ok = stmt.(*tree.DataBranchDiff); !ok {
 		if mergeStmt, ok = stmt.(*tree.DataBranchMerge); !ok {
 			if pickStmt, ok = stmt.(*tree.DataBranchPick); !ok {
 				return moerr.NewNotSupportedNoCtxf("data branch not supported: %v", stmt)
 			}
 		}
-	}
-
-	// DIFF, PICK, and MERGE all create and drop apply tables. Enter the
-	// lineage-owner lifecycle before resolving either endpoint, so their nested
-	// DDL follows the same lineage -> view-metadata -> object lock order as
-	// ordinary DROP, clone, and restore paths.
-	bh, deferred, err = getDataBranchMutationExecutor(
-		execCtx.reqCtx,
-		ses,
-		false,
-		&BackgroundExecOption{forcePessimisticRC: true},
-	)
-	if err != nil {
-		return
-	}
-	if deferred != nil {
-		defer finishDataBranchComponent(execCtx.reqCtx, deferred, &err)
 	}
 
 	ctx, cancel := context.WithCancel(execCtx.reqCtx)
@@ -1100,6 +1091,15 @@ func diffMergeAgency(
 		}
 	}()
 
+	if diffStmt != nil && summarySink != nil {
+		defer summarySink.releaseKeys()
+		wg.Add(1)
+		return diffOnBase(ctx, ses, bh, wg, dagInfo, tblStuff,
+			compositeOption{onlineApply: true}, func(w batchWithKind) (bool, error) {
+				defer tblStuff.retPool.releaseRetBatch(w.batch, false)
+				return false, summarySink.observe(ses, tblStuff, w)
+			}, nil, nil, nil, nil)
+	}
 	if diffStmt != nil {
 		if err = buildOutputSchema(ctx, ses, diffStmt, tblStuff); err != nil {
 			return
@@ -1163,7 +1163,10 @@ func diffMergeAgency(
 		// A retry must never cancel a concurrent LCA probe.
 		var summary *dataBranchMergeSummary
 		if mergeStmt != nil && mergeStmt.OutputSummary {
-			summary = newDataBranchMergeSummary()
+			summary = summarySink
+			if summary == nil {
+				summary = newDataBranchMergeSummary()
+			}
 			summary.failOnEqualOverlap = copt.conflictOpt != nil && copt.conflictOpt.Opt == tree.CONFLICT_FAIL
 			copt.mergeSummary = summary
 			defer summary.releaseKeys()
@@ -1188,7 +1191,7 @@ func diffMergeAgency(
 		if err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce, summary != nil); err != nil {
 			return err
 		}
-		if summary != nil {
+		if summary != nil && summarySink == nil {
 			return summary.output(execCtx.reqCtx, ses)
 		}
 		return nil

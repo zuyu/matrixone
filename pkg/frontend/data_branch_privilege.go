@@ -63,6 +63,10 @@ func authenticateDataBranchStatement(
 		delta, err := authenticateDataBranchCreateTable(ctx, ses, st)
 		add(delta)
 		return stats, err
+	case *tree.DataBranchDatabase:
+		// Authorize the resolved table set inside the operation's transaction,
+		// before executing any table. This also covers historical tables.
+		return stats, nil
 	case *tree.DataBranchCreateDatabase:
 		// CREATE DATABASE source resolution must be shared with execution to
 		// avoid authorizing a different object set. It runs inside

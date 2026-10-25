@@ -7024,6 +7024,7 @@ func determinePrivilegeSetOfStatement(stmt tree.Statement) *privilege {
 	case *tree.DataBranchCreateTable,
 		*tree.DataBranchDeleteTable,
 		*tree.DataBranchMerge,
+		*tree.DataBranchDatabase,
 		*tree.DataBranchDiff,
 		*tree.DataBranchPick,
 		*tree.DataBranchCreateDatabase,
@@ -7039,6 +7040,10 @@ func determinePrivilegeSetOfStatement(stmt tree.Statement) *privilege {
 			writeDatabaseTargets = append(writeDatabaseTargets, string(st.DstDatabase))
 		case *tree.DataBranchDeleteDatabase:
 			writeDatabaseTargets = append(writeDatabaseTargets, string(st.DatabaseName))
+		case *tree.DataBranchDatabase:
+			if st.Operation != "diff" {
+				writeDatabaseTargets = append(writeDatabaseTargets, st.Destination.ObjectName.String())
+			}
 		case *tree.DataBranchMerge:
 			appendWriteTableNameDatabaseName(&st.DstTable)
 		case *tree.DataBranchPick:
@@ -9014,7 +9019,7 @@ func authenticateUserCanExecuteStatementWithObjectTypeAccountAndDatabase(ctx con
 			}
 			return true, stats, nil
 		case *tree.CloneTable, *tree.CloneDatabase,
-			*tree.DataBranchDiff, *tree.DataBranchMerge, *tree.DataBranchPick,
+			*tree.DataBranchDatabase, *tree.DataBranchDiff, *tree.DataBranchMerge, *tree.DataBranchPick,
 			*tree.DataBranchCreateTable, *tree.DataBranchCreateDatabase,
 			*tree.DataBranchDeleteTable, *tree.DataBranchDeleteDatabase:
 			return true, stats, nil

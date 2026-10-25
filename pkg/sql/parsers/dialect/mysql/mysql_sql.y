@@ -848,7 +848,7 @@ func makeWindowSpec(refName *tree.CStr, partitionBy tree.Exprs, orderBy tree.Ord
 %type <unresolvedName> insert_target_column
 %type <str> optype_opt
 %type <str> optype
-%type <identifierList> column_list column_list_opt partition_clause_opt partition_id_list accounts_list restore_db_scope restore_table_scope diff_columns_opt merge_insert_column_list
+%type <identifierList> column_list column_list_opt partition_clause_opt partition_id_list accounts_list restore_db_scope restore_table_scope branch_database_tables_opt branch_database_ignore_opt diff_columns_opt merge_insert_column_list
 %type <insertColumns> insert_column_list
 %type <insertPartition> insert_partition_clause_opt
 %type <partitionValues> insert_partition_value_list
@@ -10614,6 +10614,14 @@ branch_stmt:
 	t.DatabaseName = tree.Identifier($5)
 	$$ = t
     }
+|   DATA BRANCH DIFF DATABASE table_name AGAINST table_name branch_database_tables_opt branch_database_ignore_opt OUTPUT SUMMARY
+    {
+        $$ = &tree.DataBranchDatabase{Operation: "diff", Source: *$5, Destination: *$7, Tables: $8, IgnoreTables: $9}
+    }
+|   DATA BRANCH MERGE DATABASE table_name INTO table_name branch_database_tables_opt branch_database_ignore_opt conflict_opt OUTPUT SUMMARY
+    {
+        $$ = &tree.DataBranchDatabase{Operation: "merge", Source: *$5, Destination: *$7, Tables: $8, IgnoreTables: $9, ConflictOpt: $10}
+    }
 |   DATA BRANCH DIFF table_name AGAINST table_name diff_columns_opt diff_output_opt
     {
     	t := tree.NewDataBranchDiff()
@@ -10691,6 +10699,14 @@ branch_stmt:
     	t.ConflictOpt = $13
     	$$ = t
     }
+
+branch_database_tables_opt:
+    { $$ = nil }
+|   TABLES '(' column_list ')' { $$ = $3 }
+
+branch_database_ignore_opt:
+    { $$ = nil }
+|   IGNORE TABLES '(' column_list ')' { $$ = $4 }
 
 diff_columns_opt:
     {

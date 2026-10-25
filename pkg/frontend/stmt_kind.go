@@ -84,6 +84,7 @@ func changesSessionCatalog(stmt tree.Statement, queryPlan *plan.Plan) bool {
 		*tree.DataBranchCreateDatabase,
 		*tree.DataBranchDeleteTable,
 		*tree.DataBranchDeleteDatabase,
+		*tree.DataBranchDatabase,
 		*tree.DataBranchMerge,
 		*tree.DataBranchPick:
 		return true
@@ -94,7 +95,7 @@ func changesSessionCatalog(stmt tree.Statement, queryPlan *plan.Plan) bool {
 func isDataBranchStatement(stmt tree.Statement) bool {
 	switch stmt.(type) {
 	case *tree.DataBranchCreateTable, *tree.DataBranchCreateDatabase,
-		*tree.DataBranchDiff, *tree.DataBranchMerge, *tree.DataBranchPick,
+		*tree.DataBranchDatabase, *tree.DataBranchDiff, *tree.DataBranchMerge, *tree.DataBranchPick,
 		*tree.DataBranchDeleteTable, *tree.DataBranchDeleteDatabase:
 		return true
 	default:
@@ -334,6 +335,8 @@ func statementCanBeExecutedInUncommittedTransaction(
 		*tree.DataBranchDeleteDatabase,
 		*tree.DataBranchDiff:
 		return true, nil
+	case *tree.DataBranchDatabase:
+		return st.Operation == "diff" || ses.IsBackgroundSession() || ses.GetTxnHandler().OptionBitsIsSet(OPTION_BEGIN), nil
 	case *tree.DataBranchMerge:
 		// MERGE reuses an explicit BEGIN transaction, but cannot run inside an
 		// implicit autocommit=0 transaction because that path would manage and

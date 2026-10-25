@@ -560,7 +560,7 @@ func (cwft *TxnComputationWrapper) Compile(any any, fill func(*batch.Batch, *per
 			*tree.CreatePublication, *tree.AlterPublication, *tree.DropPublication,
 			*tree.ShowPublications, *tree.ShowPublicationCoverage,
 			*tree.DataBranchCreateTable, *tree.DataBranchCreateDatabase,
-			*tree.DataBranchDiff, *tree.DataBranchMerge, *tree.DataBranchPick,
+			*tree.DataBranchDatabase, *tree.DataBranchDiff, *tree.DataBranchMerge, *tree.DataBranchPick,
 			*tree.DataBranchDeleteTable, *tree.DataBranchDeleteDatabase:
 			return nil, nil
 		}
