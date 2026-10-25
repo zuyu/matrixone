@@ -35,10 +35,11 @@ func TestDataBranchMergeStageReuse(t *testing.T) {
 		exec("create database stage_reuse_dst")
 		defer cleanupSQLIntegration(t, cn, "drop database if exists stage_reuse_dst")
 		// Both change sets exceed the 81,920-row SQL flush limit, exercising
-		// reuse of each stage before its final nonempty DROP.
+		// reuse of each stage before its final nonempty DROP. DECIMAL keeps
+		// UPDATE on the staging path when integer updates use inline VALUES.
 		const n, deleted = 90000, 85000
 		for _, name := range []string{"u", "d"} {
-			exec("create table stage_reuse_dst." + name + "(id int primary key,v int)")
+			exec("create table stage_reuse_dst." + name + "(id int primary key,v decimal(20,0))")
 			exec(fmt.Sprintf("insert into stage_reuse_dst.%s select result,result from generate_series(1,%d) g", name, n))
 		}
 		exec("data branch create database stage_reuse_src from stage_reuse_dst")

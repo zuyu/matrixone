@@ -158,6 +158,9 @@ type applyBatchInfo struct {
 	// matching rows. Keep this separate from disableInsertStage, which also
 	// disables UPDATE staging for keyless and exact floating-point keys.
 	directInsert bool
+	// Small integer-only MERGE updates join typed VALUES without a staging table.
+	// Nil keeps the existing staged path (including PICK and SQL output).
+	inlineUpdateCasts []string
 	// Online MERGE prepares each stage at its first nonempty flush. Other
 	// consumers (PICK and portable SQL output) keep eager initialization.
 	prepareStage func(kind string) error
@@ -225,8 +228,36 @@ func buildDataBranchApplyLayout(
 	batchInfo = newApplyBatchInfo(ctx, ses, tblStuff, deleteKeyColIdxes, disableInsertStage)
 	if batchInfo != nil {
 		batchInfo.directInsert = mode == dataBranchApplyModeOnlineMerge
+		if mode == dataBranchApplyModeOnlineMerge {
+			batchInfo.inlineUpdateCasts = dataBranchInlineUpdateCasts(tblStuff, batchInfo)
+		}
 	}
 	return false, deleteKeyColIdxes, batchInfo
+}
+
+// Keep the first VALUES apply path to integer columns: explicit casts retain
+// signedness and type even for all-NULL columns and uint64 boundary values.
+// Other types keep their existing CTAS coercion, collation, and special updates.
+func dataBranchInlineUpdateCasts(tblStuff tableStuff, info *applyBatchInfo) []string {
+	if info.disableInsertStage || len(info.stagedUpdateNames) == 0 || len(info.specialUpdateNames) != 0 {
+		return nil
+	}
+	casts := make([]string, len(info.updateValueIdxes))
+	for i, idx := range info.updateValueIdxes {
+		switch tblStuff.def.colTypes[idx].Oid {
+		case types.T_int8, types.T_int16, types.T_int32:
+			casts[i] = "INT"
+		case types.T_int64:
+			casts[i] = "BIGINT"
+		case types.T_uint8, types.T_uint16, types.T_uint32:
+			casts[i] = "INT UNSIGNED"
+		case types.T_uint64:
+			casts[i] = "BIGINT UNSIGNED"
+		default:
+			return nil
+		}
+	}
+	return casts
 }
 
 func dataBranchDeleteKeyColIdxes(tblStuff tableStuff, mode dataBranchApplyMode) []int {
@@ -349,7 +380,7 @@ func (batchInfo *applyBatchInfo) stagedDeleteSQL(baseTable, deleteTable string) 
 	), nil
 }
 
-func (batchInfo *applyBatchInfo) stagedUpdateSQL(baseTable, updateTable string) (string, error) {
+func (batchInfo *applyBatchInfo) updateJoinSQL(baseTable, updateTable string, sourceColumns []string) (string, error) {
 	if err := batchInfo.validateDeleteKeyLayout(); err != nil {
 		return "", err
 	}
@@ -375,9 +406,13 @@ func (batchInfo *applyBatchInfo) stagedUpdateSQL(baseTable, updateTable string) 
 		right := fmt.Sprintf("%s.%s", stageAlias, quoteIdentifierForSQL(batchInfo.deleteStageNames[i]))
 		predicates[i] = dataBranchSQLKeyEqual(left, right, batchInfo.deleteKeyTypes[i])
 	}
+	sourceAlias := stageAlias
+	if len(sourceColumns) > 0 {
+		sourceAlias += "(" + joinQuotedColumnNames(sourceColumns) + ")"
+	}
 	return fmt.Sprintf(
 		"update %s as %s join %s as %s on %s set %s",
-		baseTable, baseAlias, updateTable, stageAlias, strings.Join(predicates, " AND "), strings.Join(assignments, ","),
+		baseTable, baseAlias, updateTable, sourceAlias, strings.Join(predicates, " AND "), strings.Join(assignments, ","),
 	), nil
 }
 
@@ -2011,9 +2046,8 @@ func appendDataBranchApplyRowAsSQLValues(
 		if len(appender.batchInfo.updateValueIdxes) == 0 {
 			return moerr.NewInternalErrorNoCtx("Data Branch update staging has no values")
 		}
-		if err = writeInsertRowValues(
-			ses, tblStuff, row, tmpValsBuffer, appender.batchInfo.updateValueIdxes,
-		); err != nil {
+		err = writeInsertRowValues(ses, tblStuff, row, tmpValsBuffer, appender.batchInfo.updateValueIdxes)
+		if err != nil {
 			return err
 		}
 	} else {
@@ -2030,7 +2064,13 @@ func appendDataBranchApplyRowAsSQLValues(
 		return nil
 	}
 
-	return appender.appendRow(kind, tmpValsBuffer.Bytes())
+	if err = appender.appendRow(kind, tmpValsBuffer.Bytes()); err != nil {
+		return err
+	}
+	if kind == diffUpdate {
+		return appender.appendInlineUpdateRow(row)
+	}
+	return nil
 }
 
 func appendBatchRowsAsSQLValues(
@@ -2678,9 +2718,44 @@ type sqlValuesAppender struct {
 	writeFile         func([]byte) error
 }
 
+// Keep VALUES parsing bounded. Large UPDATE batches are faster through the
+// existing staging loader; retain their raw values while considering inline SQL.
+const (
+	maxInlineUpdateRows  = 128
+	maxInlineUpdateCells = 512
+)
+
 type dataBranchUpdateBuffer struct {
-	cnt int
-	buf bytes.Buffer
+	cnt       int
+	buf       bytes.Buffer
+	inlineCnt int
+	inlineBuf bytes.Buffer
+}
+
+// appendRow may flush the previous batch, so collect the inline candidate only
+// after it has appended the current raw row. Once too large, abandon only this
+// batch's candidate; the next batch may still be small enough to use VALUES.
+func (sva sqlValuesAppender) appendInlineUpdateRow(row []any) error {
+	state, info := sva.updateState, sva.batchInfo
+	if len(info.inlineUpdateCasts) == 0 {
+		return nil
+	}
+	if state.cnt > maxInlineUpdateRows || state.cnt*len(info.updateValueIdxes) > maxInlineUpdateCells {
+		state.inlineCnt = 0
+		state.inlineBuf.Reset()
+		return nil
+	}
+	if state.inlineCnt != state.cnt-1 {
+		return nil
+	}
+	if state.inlineCnt > 0 {
+		state.inlineBuf.WriteByte(',')
+	}
+	if err := writeInlineUpdateRowValues(sva.ses, sva.tblStuff, row, &state.inlineBuf, info); err != nil {
+		return err
+	}
+	state.inlineCnt++
+	return nil
 }
 
 func (sva sqlValuesAppender) flushAll() error {
@@ -2704,13 +2779,38 @@ func (sva sqlValuesAppender) flushUpdates() error {
 	if err := sva.flushDeletesOrInserts(); err != nil {
 		return err
 	}
-	if err := flushStagedUpdateValues(
-		sva.ctx, sva.ses, sva.bh, sva.updateState.buf.Bytes(), sva.batchInfo, sva.writeFile,
-	); err != nil {
+	var err error
+	if sva.updateState.inlineCnt == sva.updateState.cnt {
+		err = flushInlineUpdateValues(sva.ctx, sva.ses, sva.bh, sva.updateState.inlineBuf.Bytes(), sva.batchInfo, sva.writeFile)
+	} else {
+		err = flushStagedUpdateValues(sva.ctx, sva.ses, sva.bh, sva.updateState.buf.Bytes(), sva.batchInfo, sva.writeFile)
+	}
+	if err != nil {
 		return err
 	}
+
 	sva.updateState.cnt = 0
 	sva.updateState.buf.Reset()
+	sva.updateState.inlineCnt = 0
+	sva.updateState.inlineBuf.Reset()
+	return nil
+}
+
+func writeInlineUpdateRowValues(ses *Session, tblStuff tableStuff, row []any, buf *bytes.Buffer, info *applyBatchInfo) error {
+	buf.WriteString("row(")
+	for i, idx := range info.updateValueIdxes {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteString("cast(")
+		if err := formatValIntoString(ses, row[idx], tblStuff.def.colTypes[idx], buf); err != nil {
+			return err
+		}
+		buf.WriteString(" as ")
+		buf.WriteString(info.inlineUpdateCasts[i])
+		buf.WriteByte(')')
+	}
+	buf.WriteByte(')')
 	return nil
 }
 
@@ -3097,6 +3197,19 @@ func clearApplyStage(
 	return execRetryableSQLStatements(ctx, ses, bh, writeFile, []string{sql})
 }
 
+func flushInlineUpdateValues(
+	ctx context.Context, ses *Session, bh BackgroundExec, values []byte,
+	batchInfo *applyBatchInfo, writeFile func([]byte) error,
+) error {
+	baseTable := qualifiedTableName(batchInfo.dbName, batchInfo.baseTable)
+	columns := append(append([]string(nil), batchInfo.writableNames...), batchInfo.deleteStageNames...)
+	stmt, err := batchInfo.updateJoinSQL(baseTable, "(values "+string(values)+")", columns)
+	if err != nil {
+		return err
+	}
+	return execRetryableSQLStatements(ctx, ses, bh, writeFile, []string{stmt})
+}
+
 func flushStagedUpdateValues(
 	ctx context.Context,
 	ses *Session,
@@ -3118,7 +3231,7 @@ func flushStagedUpdateValues(
 	baseTable := qualifiedTableName(batchInfo.dbName, batchInfo.baseTable)
 	updateTable := qualifiedTableName(batchInfo.dbName, batchInfo.updateTable)
 	insertStmt := fmt.Sprintf("insert into %s values %s", updateTable, values)
-	updateStmt, err := batchInfo.stagedUpdateSQL(baseTable, updateTable)
+	updateStmt, err := batchInfo.updateJoinSQL(baseTable, updateTable, nil)
 	if err != nil {
 		return err
 	}

@@ -13,6 +13,7 @@ package frontend
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -33,13 +34,25 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 	native := batchWithKind{kind: diffInsert, fromUpdate: true, requiresNativeUpdate: true}
 	restore := batchWithKind{kind: diffInsert, fromUpdate: true, restoreMissing: true}
 	for _, tc := range []struct {
-		name    string
-		ops     []batchWithKind
-		want    []string
-		fakePK  bool
-		failure string
+		name      string
+		ops       []batchWithKind
+		want      []string
+		fakePK    bool
+		integer   bool
+		rowsPerOp []int
+		extraCols int
+		failure   string
 	}{
 		{name: "empty"},
+		{name: "inline_cells_limit", integer: true, extraCols: 2, ops: []batchWithKind{update}, rowsPerOp: []int{102}},
+		{name: "inline_cells_above_limit", integer: true, extraCols: 2, ops: []batchWithKind{update}, rowsPerOp: []int{103}, want: []string{"upd"}},
+		{name: "inline_limit", integer: true, ops: []batchWithKind{update}, rowsPerOp: []int{128}},
+		{name: "inline_above_limit", integer: true, ops: []batchWithKind{update}, rowsPerOp: []int{129}, want: []string{"upd"}},
+		{name: "inline_between_staged", integer: true, ops: []batchWithKind{update, insert, update, insert, update}, rowsPerOp: []int{129, 1, 1, 1, 129}, want: []string{"upd"}},
+		{name: "inline_update", integer: true, ops: []batchWithKind{oldUpdate, update}},
+		{name: "inline_repeated", integer: true, ops: []batchWithKind{update, insert, update}},
+		{name: "inline_failure", integer: true, ops: []batchWithKind{update}, failure: "apply"},
+		{name: "inline_cancel", integer: true, ops: []batchWithKind{update, insert}, failure: "cancel"},
 		{name: "ignored_update_delete", ops: []batchWithKind{oldUpdate}},
 		{name: "insert", ops: []batchWithKind{insert}},
 		{name: "delete", ops: []batchWithKind{del}, want: []string{"del"}},
@@ -63,6 +76,18 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 			ses := newValidateSession(t)
 			ctrl := gomock.NewController(t)
 			tbl := newTestBranchTableStuff(ctrl)
+			if tc.integer {
+				tbl.def.colTypes[1] = types.T_int64.ToType()
+			}
+			for i := 0; i < tc.extraCols; i++ {
+				idx := len(tbl.def.colNames)
+				tbl.def.colNames = append(tbl.def.colNames, fmt.Sprintf("extra%d", i))
+				tbl.def.colTypes = append(tbl.def.colTypes, types.T_int64.ToType())
+				tbl.def.visibleIdxes = append(tbl.def.visibleIdxes, idx)
+				tbl.def.writableIdxes = append(tbl.def.writableIdxes, idx)
+				tbl.def.commonVisibleIdxes = append(tbl.def.commonVisibleIdxes, idx)
+				tbl.def.commonWritableIdxes = append(tbl.def.commonWritableIdxes, idx)
+			}
 			if tc.fakePK {
 				tbl = newFakePKBranchTableStuff(ctrl)
 				tbl.retPool = &retBatchList{}
@@ -82,6 +107,12 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 			bh.EXPECT().Exec(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, sql string) error {
 				match := stageName.FindStringSubmatch(sql)
 				if match == nil {
+					if strings.HasPrefix(sql, "update ") && strings.Contains(sql, "join (values ") {
+						loads["inline"]++
+						if tc.failure == "apply" {
+							return injected
+						}
+					}
 					if strings.HasPrefix(sql, "insert into") {
 						loads["direct"]++
 						if strings.HasPrefix(tc.failure, "apply") {
@@ -137,17 +168,25 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 			bh.EXPECT().ClearExecResultSet().AnyTimes()
 			produce := func(emit emitFunc) error {
 				require.Zero(t, createCalls, "no stage DDL before production")
-				for _, wrapped := range tc.ops {
+				for opIndex, wrapped := range tc.ops {
 					bat := tbl.retPool.acquireRetBatch(tbl, false)
-					require.NoError(t, vector.AppendFixed(bat.Vecs[0], int64(1), false, ses.proc.Mp()))
-					for _, vec := range bat.Vecs[1:] {
-						if vec.GetType().Oid == types.T_uint64 {
-							require.NoError(t, vector.AppendFixed(vec, uint64(1), false, ses.proc.Mp()))
-						} else {
-							require.NoError(t, vector.AppendBytes(vec, []byte("row"), false, ses.proc.Mp()))
+					rows := 1
+					if tc.rowsPerOp != nil {
+						rows = tc.rowsPerOp[opIndex]
+					}
+					for i := 0; i < rows; i++ {
+						require.NoError(t, vector.AppendFixed(bat.Vecs[0], int64(i+1), false, ses.proc.Mp()))
+						for _, vec := range bat.Vecs[1:] {
+							if vec.GetType().Oid == types.T_int64 {
+								require.NoError(t, vector.AppendFixed(vec, int64(2), false, ses.proc.Mp()))
+							} else if vec.GetType().Oid == types.T_uint64 {
+								require.NoError(t, vector.AppendFixed(vec, uint64(1), false, ses.proc.Mp()))
+							} else {
+								require.NoError(t, vector.AppendBytes(vec, []byte("row"), false, ses.proc.Mp()))
+							}
 						}
 					}
-					bat.SetRowCount(1)
+					bat.SetRowCount(rows)
 					wrapped.batch = bat
 					if _, err := emitBatch(emit, wrapped, false, tbl.retPool); err != nil {
 						return err
@@ -206,6 +245,18 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 			}
 			if tc.name == "insert" || tc.name == "restore_deleted_target" || tc.name == "keyless_insert" {
 				require.Equal(t, 1, loads["direct"], "flush must issue one target INSERT")
+			}
+			if tc.name == "inline_cells_limit" || tc.name == "inline_update" || tc.name == "inline_failure" || tc.name == "inline_limit" || tc.name == "inline_between_staged" {
+				require.Equal(t, 1, loads["inline"])
+			}
+			if tc.name == "inline_above_limit" || tc.name == "inline_cells_above_limit" {
+				require.Zero(t, loads["inline"])
+			}
+			if tc.name == "inline_between_staged" {
+				require.Equal(t, 2, loads["upd"])
+			}
+			if tc.name == "inline_repeated" {
+				require.Equal(t, 2, loads["inline"])
 			}
 			if tc.name == "empty" {
 				require.Zero(t, timing.phases["apply"])
