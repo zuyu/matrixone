@@ -70,7 +70,7 @@ func (w *branchRestoreWork) finish(err *error) {
 	phases["other"] = float64(max(time.Duration(0), total-measured)) / float64(time.Millisecond)
 	logutil.Info("DataBranch-Restore-Work", zap.Int("schema_version", 1),
 		zap.String("request_id", uuid.NewString()), zap.String("operation", w.operation),
-		zap.String("status", status), zap.Int("table_count", w.tables),
+		zap.String("status", status), zap.String("staging", "temporary"), zap.Int("table_count", w.tables),
 		zap.Int("sql_statements", statements), zap.Any("sql_counts", w.counts),
 		zap.Int("empty_stages", w.emptyStages), zap.Int("unknown_stages", w.unknownStages),
 		zap.Int64("materialized_rows", w.materializedRows),
@@ -87,6 +87,11 @@ func executeBranchRestorePlans(ctx context.Context, bh BackgroundExec, plans []b
 	defer func() {
 		err = errors.Join(err, work.dropStages(ctx, bh, stages))
 	}()
+	// Background temporary DDL participates in this executor's transaction.
+	// Its aliases use the upstream session's transaction/statement journal,
+	// including rollback after cancellation or a failed cleanup. DROP still
+	// removes the physical stages synchronously, without public-table catalog
+	// cleanup such as publication/view invalidation and role-privilege deletion.
 	// Preserve the original order: materialize every delta before any target
 	// write. Stage SELECTs also avoid same-table DELETE snapshot limitations.
 	for i := range plans {
@@ -107,7 +112,7 @@ func executeBranchRestorePlans(ctx context.Context, bh BackgroundExec, plans []b
 			if hasCount {
 				provider.SetLastAffectedRows(-1)
 			}
-			if err = work.exec(ctx, bh, "stage_create", "create table "+stage.table+" as "+stage.query); err != nil {
+			if err = work.exec(ctx, bh, "stage_create", "create temporary table "+stage.table+" as "+stage.query); err != nil {
 				return err
 			}
 			stages = append(stages, stage.table)
@@ -148,13 +153,13 @@ func (w *branchRestoreWork) dropStages(ctx context.Context, bh BackgroundExec, s
 		for i := end - 1; i >= start; i-- {
 			group = append(group, stages[i])
 		}
-		dropErr := w.exec(ctx, bh, "stage_drop", "drop table if exists "+strings.Join(group, ","))
+		dropErr := w.exec(ctx, bh, "stage_drop", "drop temporary table if exists "+strings.Join(group, ","))
 		err = errors.Join(err, dropErr)
 		if dropErr != nil && len(group) > 1 {
 			// Retain the batch failure so the caller rolls back, but still try
 			// every stage, as the former per-table cleanup did on failure.
 			for _, stage := range group {
-				err = errors.Join(err, w.exec(ctx, bh, "stage_drop", "drop table if exists "+stage))
+				err = errors.Join(err, w.exec(ctx, bh, "stage_drop", "drop temporary table if exists "+stage))
 			}
 		}
 		end = start

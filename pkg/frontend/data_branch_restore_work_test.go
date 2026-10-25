@@ -58,7 +58,7 @@ func TestBranchRestoreEmptyStages(t *testing.T) {
 			back.run = func(_ context.Context, sql string) error {
 				kind, _, _ := strings.Cut(sql, " ")
 				kinds = append(kinds, kind)
-				if strings.HasPrefix(sql, "create table") {
+				if strings.HasPrefix(sql, "create temporary table") {
 					require.Equal(t, int64(-1), back.rows, "reset stale counts before each CTAS")
 					if strings.Contains(sql, "t_r") {
 						back.rows = tc.rows
@@ -103,9 +103,9 @@ func TestBranchRestoreMaterializesBeforeWriting(t *testing.T) {
 		[]branchRestorePlan{restoreWorkPlan("a"), restoreWorkPlan("b")}, "revert"))
 	require.Len(t, sqls, 11)
 	for _, sql := range sqls[:4] {
-		require.True(t, strings.HasPrefix(sql, "create table"))
+		require.True(t, strings.HasPrefix(sql, "create temporary table"))
 	}
-	require.Equal(t, "drop table if exists b_d,b_r,a_d,a_r", sqls[10])
+	require.Equal(t, "drop temporary table if exists b_d,b_r,a_d,a_r", sqls[10])
 }
 
 func TestBranchRestoreKeylessAndKeyOnly(t *testing.T) {
@@ -132,7 +132,7 @@ func TestBranchRestoreCleanupBoundsAndFailures(t *testing.T) {
 			}
 			var dropped []string
 			back := &restoreWorkExec{run: func(_ context.Context, sql string) error {
-				group := strings.Split(strings.TrimPrefix(sql, "drop table if exists "), ",")
+				group := strings.Split(strings.TrimPrefix(sql, "drop temporary table if exists "), ",")
 				require.LessOrEqual(t, len(group), 128)
 				dropped = append(dropped, group...)
 				return nil
@@ -161,7 +161,7 @@ func TestBranchRestoreCleanupBoundsAndFailures(t *testing.T) {
 	err := newBranchRestoreWork("reset", 1).dropStages(t.Context(), back, []string{"a", "b"})
 	require.ErrorIs(t, err, batchErr)
 	require.ErrorIs(t, err, singleErr)
-	require.Equal(t, []string{"drop table if exists b,a", "drop table if exists b", "drop table if exists a"}, sqls)
+	require.Equal(t, []string{"drop temporary table if exists b,a", "drop temporary table if exists b", "drop temporary table if exists a"}, sqls)
 }
 
 func TestBranchRestoreFailurePreservesCleanupAndRollback(t *testing.T) {
@@ -176,7 +176,7 @@ func TestBranchRestoreFailurePreservesCleanupAndRollback(t *testing.T) {
 					dropped = append(dropped, sql)
 					return dropErr
 				}
-				if failure == "create" && strings.HasPrefix(sql, "create table t_d") {
+				if failure == "create" && strings.HasPrefix(sql, "create temporary table t_d") {
 					return original
 				}
 				if strings.HasPrefix(sql, "delete") {
@@ -215,9 +215,9 @@ func TestBranchRestoreFailurePreservesCleanupAndRollback(t *testing.T) {
 			}
 			require.True(t, finished)
 			if failure == "create" {
-				require.Equal(t, []string{"drop table if exists t_r"}, dropped)
+				require.Equal(t, []string{"drop temporary table if exists t_r"}, dropped)
 			} else {
-				require.Equal(t, []string{"drop table if exists t_d,t_r", "drop table if exists t_d", "drop table if exists t_r"}, dropped)
+				require.Equal(t, []string{"drop temporary table if exists t_d,t_r", "drop temporary table if exists t_d", "drop temporary table if exists t_r"}, dropped)
 			}
 		})
 	}

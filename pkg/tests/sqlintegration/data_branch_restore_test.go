@@ -125,7 +125,7 @@ func TestDataBranchDatabaseResetRevert(t *testing.T) {
 		require.Equal(t, "1:99", readA()[0])
 		require.Equal(t, []string{"10", "20"}, values("select cast(v as char) from dbrestore.z order by id"))
 		var stages int
-		require.NoError(t, db.QueryRowContext(ctx, "select count(*) from mo_catalog.mo_tables where reldatabase='dbrestore' and relname like '__mo_branch_restore_%'").Scan(&stages))
+		require.NoError(t, db.QueryRowContext(ctx, "select count(*) from mo_catalog.mo_tables where reldatabase='dbrestore' and relname like '%__mo_branch_restore_%'").Scan(&stages))
 		require.Zero(t, stages)
 	})
 }
@@ -202,7 +202,7 @@ func TestDataBranchRestoreEmptyStages(t *testing.T) {
 					var id uint64
 					require.NoError(t, db.QueryRowContext(ctx, "select rel_id from mo_catalog.mo_tables where reldatabase=? and relname='heap'", name).Scan(&id))
 					require.Equal(t, heapID, id)
-					require.NoError(t, db.QueryRowContext(ctx, "select count(*) from mo_catalog.mo_tables where reldatabase=? and relname like '__mo_branch_restore_%'", name).Scan(&count))
+					require.NoError(t, db.QueryRowContext(ctx, "select count(*) from mo_catalog.mo_tables where reldatabase=? and relname like '%__mo_branch_restore_%'", name).Scan(&count))
 					require.Zero(t, count)
 				}
 				execSQLRequire(t, ctx, db, "begin")
@@ -312,7 +312,95 @@ func TestDataBranchRestoreCatalogScopeAndRefresh(t *testing.T) {
 		execSQLRequire(t, ctx, db, reset)
 		require.Equal(t, 77, value("a"))
 		var stages int
-		require.NoError(t, db.QueryRowContext(ctx, "select count(*) from mo_catalog.mo_tables where reldatabase='restore_catalog' and relname like '__mo_branch_restore_%'").Scan(&stages))
+		require.NoError(t, db.QueryRowContext(ctx, "select count(*) from mo_catalog.mo_tables where reldatabase='restore_catalog' and relname like '%__mo_branch_restore_%'").Scan(&stages))
 		require.Zero(t, stages)
+	})
+}
+
+func TestDataBranchRestoreTemporaryStageLifetime(t *testing.T) {
+	runSQLIntegration(t, func(c embed.Cluster) {
+		cn, err := c.GetCNService(0)
+		require.NoError(t, err)
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+		defer cancel()
+		db, err := sql.Open("mysql", fmt.Sprintf("dump:111@tcp(127.0.0.1:%d)/", cn.GetServiceConfig().CN.Frontend.Port))
+		require.NoError(t, err)
+		defer db.Close()
+		db.SetMaxOpenConns(1)
+		for _, q := range []string{
+			"create database `restore.temp`",
+			"create table `restore.temp`.a(id int primary key,v int)",
+			"create table `restore.temp`.z(id int primary key,v int)",
+			"insert into `restore.temp`.a values(1,10)",
+			"insert into `restore.temp`.z values(1,10),(2,10)",
+			"create snapshot restore_temp_before for database `restore.temp`",
+			"update `restore.temp`.a set v=11", "update `restore.temp`.z set v=20 where id=2",
+			"create unique index restore_unique on `restore.temp`.z(v)",
+			"create snapshot restore_temp_after for database `restore.temp`",
+			"create temporary table `restore.temp`.user_temp(v int)",
+			"insert into `restore.temp`.user_temp values(7)",
+		} {
+			execSQLRequire(t, ctx, db, q)
+		}
+		defer cleanupSQLIntegration(t, cn, "drop database if exists `restore.temp`")
+		defer execSQLRequire(t, ctx, db, "drop snapshot restore_temp_before")
+		defer execSQLRequire(t, ctx, db, "drop snapshot restore_temp_after")
+		value := func(table string) int {
+			var v int
+			require.NoError(t, db.QueryRowContext(ctx, "select v from `restore.temp`."+table+" limit 1").Scan(&v))
+			return v
+		}
+		clean := func() {
+			var count int
+			// Temporary stages have a generated physical-name prefix. Check
+			// the whole suffix, including after a failed restore and rollback.
+			require.NoError(t, db.QueryRowContext(ctx, "select count(*) from mo_catalog.mo_tables where reldatabase='restore.temp' and relname like '%__mo_branch_restore_%'").Scan(&count))
+			require.Zero(t, count)
+			require.Equal(t, 7, value("user_temp"), "restore must preserve unrelated session aliases and rows")
+		}
+		reset := "data branch reset database `restore.temp` from `restore.temp`{snapshot='restore_temp_before'}"
+		revert := "data branch revert database `restore.temp` from `restore.temp`{snapshot='restore_temp_after'} against `restore.temp`{snapshot='restore_temp_before'}"
+		for _, command := range []string{reset, revert} {
+			for _, finish := range []string{"rollback", "commit"} {
+				execSQLRequire(t, ctx, db, "update `restore.temp`.a set v=99")
+				execSQLRequire(t, ctx, db, "begin")
+				execSQLRequire(t, ctx, db, command+" tables(a)")
+				require.Equal(t, 10, value("a"))
+				clean()
+				execSQLRequire(t, ctx, db, finish)
+				if finish == "rollback" {
+					require.Equal(t, 99, value("a"))
+				} else {
+					require.Equal(t, 10, value("a"))
+				}
+				clean()
+			}
+		}
+		// Failure on z must roll back the earlier write to a and remove stages.
+		for i := 0; i < 3; i++ {
+			execSQLRequire(t, ctx, db, "update `restore.temp`.a set v=88")
+			_, err = db.ExecContext(ctx, reset+" tables(a,z)")
+			require.Error(t, err)
+			require.Equal(t, 88, value("a"))
+			clean()
+			execSQLRequire(t, ctx, db, reset+" tables(a)")
+			require.Equal(t, 10, value("a"))
+			clean()
+		}
+		// Background staging must not launch an independent temporary-schema
+		// transaction: it must see an uncommitted destination database too.
+		execSQLRequire(t, ctx, db, "begin")
+		execSQLRequire(t, ctx, db, "create database restore_temp_uncommitted")
+		execSQLRequire(t, ctx, db, "create table restore_temp_uncommitted.a(id int primary key,v int)")
+		execSQLRequire(t, ctx, db, "insert into restore_temp_uncommitted.a values(1,99)")
+		execSQLRequire(t, ctx, db, "data branch reset database restore_temp_uncommitted from `restore.temp`{snapshot='restore_temp_before'} tables(a)")
+		var restored int
+		require.NoError(t, db.QueryRowContext(ctx, "select v from restore_temp_uncommitted.a").Scan(&restored))
+		require.Equal(t, 10, restored)
+		execSQLRequire(t, ctx, db, "rollback")
+		var count int
+		require.NoError(t, db.QueryRowContext(ctx, "select count(*) from mo_catalog.mo_database where datname='restore_temp_uncommitted'").Scan(&count))
+		require.Zero(t, count)
+		clean()
 	})
 }
