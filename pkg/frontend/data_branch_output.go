@@ -154,6 +154,10 @@ type applyBatchInfo struct {
 	updateValueIdxes       []int
 	disableInsertStage     bool
 	insertRowsIndividually bool
+	// MERGE inserts already carry complete values and need no relation for
+	// matching rows. Keep this separate from disableInsertStage, which also
+	// disables UPDATE staging for keyless and exact floating-point keys.
+	directInsert bool
 	// Online MERGE prepares each stage at its first nonempty flush. Other
 	// consumers (PICK and portable SQL output) keep eager initialization.
 	prepareStage func(kind string) error
@@ -215,7 +219,11 @@ func buildDataBranchApplyLayout(
 
 	deleteKeyColIdxes = dataBranchDeleteKeyColIdxes(tblStuff, mode)
 	disableInsertStage := tblStuff.def.pkKind == fakeKind && mode == dataBranchApplyModeOnlineMerge
-	return false, deleteKeyColIdxes, newApplyBatchInfo(ctx, ses, tblStuff, deleteKeyColIdxes, disableInsertStage)
+	batchInfo = newApplyBatchInfo(ctx, ses, tblStuff, deleteKeyColIdxes, disableInsertStage)
+	if batchInfo != nil {
+		batchInfo.directInsert = mode == dataBranchApplyModeOnlineMerge
+	}
+	return false, deleteKeyColIdxes, batchInfo
 }
 
 func dataBranchDeleteKeyColIdxes(tblStuff tableStuff, mode dataBranchApplyMode) []int {
@@ -3003,7 +3011,7 @@ func initApplyTables(
 		case diffDelete:
 			table, columns = deleteTable, deleteCols
 		case diffInsert:
-			if batchInfo.disableInsertStage {
+			if batchInfo.disableInsertStage || batchInfo.directInsert {
 				continue
 			}
 			table, columns = insertTable, insertCols
@@ -3049,7 +3057,7 @@ func dropApplyTables(
 		case diffDelete:
 			table = deleteTable
 		case diffInsert:
-			if batchInfo.disableInsertStage {
+			if batchInfo.disableInsertStage || batchInfo.directInsert {
 				continue
 			}
 			table = insertTable
@@ -3163,6 +3171,13 @@ func flushSqlValues(
 			return execRetryableSQLStatements(ctx, ses, bh, writeFile, []string{insertStmt, deleteStmt, clearStmt})
 		}
 
+		if batchInfo.directInsert && !batchInfo.disableInsertStage {
+			// Retain the staged path's statement executor for RC retries and
+			// the owner transaction. Existing keyless/float paths stay below.
+			stmt := fmt.Sprintf("insert into %s (%s) values %s",
+				baseTable, joinQuotedColumnNames(batchInfo.writableNames), buf.String())
+			return execRetryableSQLStatements(ctx, ses, bh, writeFile, []string{stmt})
+		}
 		if !batchInfo.disableInsertStage {
 			if err := batchInfo.ensureStage(diffInsert); err != nil {
 				return err

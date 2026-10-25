@@ -2022,6 +2022,7 @@ func TestDataBranchOutputBuildDataBranchApplyLayout(t *testing.T) {
 	require.Equal(t, []string{"id", "name", "age"}, info.writableNames)
 	require.True(t, info.disableInsertStage)
 	require.True(t, info.insertRowsIndividually)
+	require.True(t, info.directInsert)
 	require.True(t, strings.HasPrefix(info.deleteTable, "__mo_diff_del_"))
 	require.True(t, strings.HasPrefix(info.insertTable, "__mo_diff_ins_"))
 	require.True(t, strings.HasPrefix(info.updateTable, "__mo_diff_upd_"))
@@ -2048,6 +2049,7 @@ func TestDataBranchOutputBuildDataBranchApplyLayout(t *testing.T) {
 	require.NotNil(t, info)
 	require.False(t, info.disableInsertStage)
 	require.False(t, info.insertRowsIndividually)
+	require.False(t, info.directInsert, "PICK keeps staged inserts")
 
 	deleteByFullRow, deleteKeyColIdxes, info = buildDataBranchApplyLayout(
 		context.Background(), &Session{}, fakeTblStuff, dataBranchApplyModePortableSQL,
@@ -3463,7 +3465,9 @@ func TestOnlineBranchApplyOrdersPreparationProductionAndCleanup(t *testing.T) {
 				if failure == "init" {
 					require.Equal(t, lazy, produced)
 				} else if lazy && creates == 0 {
-					require.Empty(t, events, "unflushed buffers must not create or drop stages")
+					for _, sql := range events {
+						require.False(t, strings.HasPrefix(sql, "drop table"), "direct inserts must not clean up unused stages")
+					}
 				} else {
 					require.True(t, strings.HasPrefix(events[len(events)-1], "drop table if exists"), "cleanup runs after production returns")
 				}

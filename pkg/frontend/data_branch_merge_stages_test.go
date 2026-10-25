@@ -41,21 +41,21 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 	}{
 		{name: "empty"},
 		{name: "ignored_update_delete", ops: []batchWithKind{oldUpdate}},
-		{name: "insert", ops: []batchWithKind{insert}, want: []string{"ins"}},
+		{name: "insert", ops: []batchWithKind{insert}},
 		{name: "delete", ops: []batchWithKind{del}, want: []string{"del"}},
 		{name: "update", ops: []batchWithKind{oldUpdate, update}, want: []string{"upd"}},
 		{name: "native_update", ops: []batchWithKind{oldUpdate, native}},
-		{name: "restore_deleted_target", ops: []batchWithKind{oldUpdate, restore}, want: []string{"ins"}},
-		{name: "repeated_flush", ops: []batchWithKind{insert, update, del, insert, update, del}, want: []string{"ins", "upd", "del"}},
+		{name: "restore_deleted_target", ops: []batchWithKind{oldUpdate, restore}},
+		{name: "repeated_flush", ops: []batchWithKind{insert, update, del, insert, update, del}, want: []string{"upd", "del"}},
 		{name: "keyless_insert", ops: []batchWithKind{insert}, fakePK: true},
 		{name: "keyless_update", ops: []batchWithKind{oldUpdate, update}, want: []string{"del"}, fakePK: true},
-		{name: "first_create_failure", ops: []batchWithKind{insert, update}, want: []string{"ins"}, failure: "create_first"},
-		{name: "second_create_failure", ops: []batchWithKind{insert, update}, want: []string{"ins", "upd"}, failure: "create_second"},
-		{name: "apply_failure", ops: []batchWithKind{insert, update}, want: []string{"ins"}, failure: "apply"},
-		{name: "cleanup_failure", ops: []batchWithKind{insert}, want: []string{"ins"}, failure: "cleanup"},
-		{name: "preserve_apply_error", ops: []batchWithKind{insert, update}, want: []string{"ins"}, failure: "apply_and_cleanup"},
-		{name: "panic_after_flush", ops: []batchWithKind{insert, update}, want: []string{"ins"}, failure: "panic"},
-		{name: "cancel_after_flush", ops: []batchWithKind{insert, update}, want: []string{"ins"}, failure: "cancel"},
+		{name: "first_create_failure", ops: []batchWithKind{insert, update}, want: []string{"upd"}, failure: "create_first"},
+		{name: "second_create_failure", ops: []batchWithKind{update, del}, want: []string{"upd", "del"}, failure: "create_second"},
+		{name: "apply_failure", ops: []batchWithKind{insert, update}, failure: "apply"},
+		{name: "cleanup_failure", ops: []batchWithKind{update}, want: []string{"upd"}, failure: "cleanup"},
+		{name: "preserve_apply_error", ops: []batchWithKind{update, insert}, want: []string{"upd"}, failure: "apply_and_cleanup"},
+		{name: "panic_after_flush", ops: []batchWithKind{update, insert}, want: []string{"upd"}, failure: "panic"},
+		{name: "cancel_after_flush", ops: []batchWithKind{update, insert}, want: []string{"upd"}, failure: "cancel"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ses := newValidateSession(t)
@@ -79,6 +79,12 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 			bh.EXPECT().Exec(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, sql string) error {
 				match := stageName.FindStringSubmatch(sql)
 				if match == nil {
+					if strings.HasPrefix(sql, "insert into") {
+						loads["direct"]++
+						if strings.HasPrefix(tc.failure, "apply") {
+							return injected
+						}
+					}
 					return nil
 				} // direct row SQL uses no stage
 				table, kind := match[0], match[1]
@@ -162,13 +168,16 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 			}
 			require.Empty(t, ready)
 			if tc.name == "repeated_flush" {
-				require.GreaterOrEqual(t, loads["ins"], 2)
+				require.GreaterOrEqual(t, loads["direct"], 2)
 				require.GreaterOrEqual(t, loads["upd"], 2)
 				require.GreaterOrEqual(t, loads["del"], 2)
 			}
 			if len(tc.want) == 0 {
 				require.Zero(t, timing.phases["stage_init"])
 				require.Zero(t, timing.phases["stage_cleanup"])
+			}
+			if tc.name == "insert" || tc.name == "restore_deleted_target" || tc.name == "keyless_insert" {
+				require.Equal(t, 1, loads["direct"], "flush must issue one target INSERT")
 			}
 			if tc.name == "empty" {
 				require.Zero(t, timing.phases["apply"])
