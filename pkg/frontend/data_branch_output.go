@@ -161,6 +161,8 @@ type applyBatchInfo struct {
 	// Small integer-only MERGE updates join typed VALUES without a staging table.
 	// Nil keeps the existing staged path (including PICK and SQL output).
 	inlineUpdateCasts []string
+	// Small MERGE deletes with explicit integer keys use a literal IN list.
+	inlineDelete bool
 	// Online MERGE prepares each stage at its first nonempty flush. Other
 	// consumers (PICK and portable SQL output) keep eager initialization.
 	prepareStage func(kind string) error
@@ -230,6 +232,7 @@ func buildDataBranchApplyLayout(
 		batchInfo.directInsert = mode == dataBranchApplyModeOnlineMerge
 		if mode == dataBranchApplyModeOnlineMerge {
 			batchInfo.inlineUpdateCasts = dataBranchInlineUpdateCasts(tblStuff, batchInfo)
+			batchInfo.inlineDelete = tblStuff.def.pkKind != fakeKind && dataBranchIntegerDeleteKeys(batchInfo)
 		}
 	}
 	return false, deleteKeyColIdxes, batchInfo
@@ -258,6 +261,41 @@ func dataBranchInlineUpdateCasts(tblStuff tableStuff, info *applyBatchInfo) []st
 		}
 	}
 	return casts
+}
+
+// Literal integer keys retain exact equality without CTAS coercion or
+// collation. Hidden keyless identities and other types retain stage matching.
+func dataBranchIntegerDeleteKeys(info *applyBatchInfo) bool {
+	if len(info.deleteKeyTypes) == 0 {
+		return false
+	}
+	for _, typ := range info.deleteKeyTypes {
+		switch typ.Oid {
+		case types.T_int8, types.T_int16, types.T_int32, types.T_int64,
+			types.T_uint8, types.T_uint16, types.T_uint32, types.T_uint64:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+const (
+	maxInlineDeleteRows  = 128
+	maxInlineDeleteCells = 512
+)
+
+func (batchInfo *applyBatchInfo) canInlineDelete(rows int) bool {
+	return batchInfo.inlineDelete && rows > 0 && rows <= maxInlineDeleteRows &&
+		len(batchInfo.deleteKeyNames) <= maxInlineDeleteCells/rows
+}
+
+func (batchInfo *applyBatchInfo) deleteInSQL(baseTable, values string) string {
+	pkExpr := quoteIdentifierForSQL(batchInfo.deleteKeyNames[0])
+	if len(batchInfo.deleteKeyNames) > 1 {
+		pkExpr = fmt.Sprintf("(%s)", joinQuotedColumnNames(batchInfo.deleteKeyNames))
+	}
+	return fmt.Sprintf("delete from %s where %s in (%s)", baseTable, pkExpr, values)
 }
 
 func dataBranchDeleteKeyColIdxes(tblStuff tableStuff, mode dataBranchApplyMode) []int {
@@ -356,14 +394,8 @@ func (batchInfo *applyBatchInfo) stagedDeleteSQL(baseTable, deleteTable string) 
 	}
 	deleteStageNames := batchInfo.deleteStageNames
 	if !batchInfo.deleteNeedsExactFloatKeyMatch() {
-		pkExpr := quoteIdentifierForSQL(batchInfo.deleteKeyNames[0])
-		if len(batchInfo.deleteKeyNames) > 1 {
-			pkExpr = fmt.Sprintf("(%s)", joinQuotedColumnNames(batchInfo.deleteKeyNames))
-		}
-		return fmt.Sprintf(
-			"delete from %s where %s in (select %s from %s)",
-			baseTable, pkExpr, joinQuotedColumnNames(deleteStageNames), deleteTable,
-		), nil
+		return batchInfo.deleteInSQL(baseTable,
+			fmt.Sprintf("select %s from %s", joinQuotedColumnNames(deleteStageNames), deleteTable)), nil
 	}
 
 	const baseAlias = "branch_apply_base"
@@ -2642,7 +2674,7 @@ func tryFlushDeletesOrInserts(
 
 	flushDeletes := func() error {
 		if err = flushSqlValues(
-			ctx, ses, bh, tblStuff, deletesBuf, true, deleteByFullRow, batchInfo, writeFile,
+			ctx, ses, bh, tblStuff, deletesBuf, *deleteCnt, true, deleteByFullRow, batchInfo, writeFile,
 		); err != nil {
 			return err
 		}
@@ -2654,7 +2686,7 @@ func tryFlushDeletesOrInserts(
 
 	flushInserts := func() error {
 		if err = flushSqlValues(
-			ctx, ses, bh, tblStuff, insertBuf, false, false, batchInfo, writeFile,
+			ctx, ses, bh, tblStuff, insertBuf, *insertCnt, false, false, batchInfo, writeFile,
 		); err != nil {
 			return err
 		}
@@ -3260,6 +3292,7 @@ func flushSqlValues(
 	bh BackgroundExec,
 	tblStuff tableStuff,
 	buf *bytes.Buffer,
+	rowCount int,
 	isDeleteFrom bool,
 	deleteByFullRow bool,
 	batchInfo *applyBatchInfo,
@@ -3297,6 +3330,13 @@ func flushSqlValues(
 		insertTable := qualifiedTableName(batchInfo.dbName, batchInfo.insertTable)
 
 		if isDeleteFrom {
+			if batchInfo.canInlineDelete(rowCount) {
+				if err := batchInfo.validateDeleteKeyLayout(); err != nil {
+					return err
+				}
+				stmt := batchInfo.deleteInSQL(baseTable, buf.String())
+				return execRetryableSQLStatements(ctx, ses, bh, writeFile, []string{stmt})
+			}
 			insertStmt := fmt.Sprintf("insert into %s values %s", deleteTable, buf.String())
 			deleteStmt, err := batchInfo.stagedDeleteSQL(baseTable, deleteTable)
 			if err != nil {

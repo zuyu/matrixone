@@ -1673,6 +1673,7 @@ func TestDataBranchOutputFlushSqlValuesWithWriteFile(t *testing.T) {
 		nil,
 		tblStuff,
 		bytes.NewBufferString("delete from db1.t1 where id = 1 limit 1;\n"),
+		1,
 		true,
 		true,
 		nil,
@@ -1685,6 +1686,7 @@ func TestDataBranchOutputFlushSqlValuesWithWriteFile(t *testing.T) {
 		nil,
 		tblStuff,
 		bytes.NewBufferString("(1,'a')"),
+		1,
 		true,
 		false,
 		batchInfo,
@@ -1697,6 +1699,7 @@ func TestDataBranchOutputFlushSqlValuesWithWriteFile(t *testing.T) {
 		nil,
 		tblStuff,
 		bytes.NewBufferString("(2,'b')"),
+		1,
 		false,
 		false,
 		nil,
@@ -1745,6 +1748,7 @@ func TestDataBranchOutputFlushSqlValuesUsesExactFloatKeyMatch(t *testing.T) {
 	var out bytes.Buffer
 	require.NoError(t, flushSqlValues(
 		context.Background(), nil, nil, tableStuff{}, bytes.NewBufferString("(1,2,3)"),
+		1,
 		true, false, batchInfo, func(b []byte) error {
 			_, err := out.Write(b)
 			return err

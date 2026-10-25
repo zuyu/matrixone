@@ -34,14 +34,16 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 	native := batchWithKind{kind: diffInsert, fromUpdate: true, requiresNativeUpdate: true}
 	restore := batchWithKind{kind: diffInsert, fromUpdate: true, restoreMissing: true}
 	for _, tc := range []struct {
-		name      string
-		ops       []batchWithKind
-		want      []string
-		fakePK    bool
-		integer   bool
-		rowsPerOp []int
-		extraCols int
-		failure   string
+		name          string
+		ops           []batchWithKind
+		want          []string
+		fakePK        bool
+		integer       bool
+		rowsPerOp     []int
+		deleteKeys    int
+		inlineDeletes int
+		extraCols     int
+		failure       string
 	}{
 		{name: "empty"},
 		{name: "inline_cells_limit", integer: true, extraCols: 2, ops: []batchWithKind{update}, rowsPerOp: []int{102}},
@@ -55,17 +57,24 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 		{name: "inline_cancel", integer: true, ops: []batchWithKind{update, insert}, failure: "cancel"},
 		{name: "ignored_update_delete", ops: []batchWithKind{oldUpdate}},
 		{name: "insert", ops: []batchWithKind{insert}},
-		{name: "delete", ops: []batchWithKind{del}, want: []string{"del"}},
+		{name: "delete", ops: []batchWithKind{del}, inlineDeletes: 1},
+		{name: "delete_limit", ops: []batchWithKind{del}, rowsPerOp: []int{128}, inlineDeletes: 1},
+		{name: "delete_above_limit", ops: []batchWithKind{del}, rowsPerOp: []int{129}, want: []string{"del"}},
+		{name: "delete_cells_limit", integer: true, extraCols: 3, deleteKeys: 5, ops: []batchWithKind{del}, rowsPerOp: []int{102}, inlineDeletes: 1},
+		{name: "delete_cells_above_limit", integer: true, extraCols: 3, deleteKeys: 5, ops: []batchWithKind{del}, rowsPerOp: []int{103}, want: []string{"del"}},
+		{name: "delete_between_staged", ops: []batchWithKind{del, update, del, update, del}, rowsPerOp: []int{129, 1, 1, 1, 129}, want: []string{"del", "upd"}, inlineDeletes: 1},
+		{name: "delete_failure", ops: []batchWithKind{del}, failure: "apply", inlineDeletes: 1},
+		{name: "delete_cancel", ops: []batchWithKind{del, update}, failure: "cancel", inlineDeletes: 1},
 		{name: "update", ops: []batchWithKind{oldUpdate, update}, want: []string{"upd"}},
 		{name: "native_update", ops: []batchWithKind{oldUpdate, native}},
 		{name: "restore_deleted_target", ops: []batchWithKind{oldUpdate, restore}},
-		{name: "repeated_flush", ops: []batchWithKind{insert, update, del, insert, update, del}, want: []string{"upd", "del"}},
+		{name: "repeated_flush", ops: []batchWithKind{insert, update, del, insert, update, del}, rowsPerOp: []int{1, 1, 129, 1, 1, 129}, want: []string{"upd", "del"}},
 		{name: "clear_update_failure", ops: []batchWithKind{update, insert, update}, want: []string{"upd"}, failure: "clear"},
-		{name: "clear_delete_failure", ops: []batchWithKind{del, update, del}, want: []string{"del", "upd"}, failure: "clear"},
+		{name: "clear_delete_failure", ops: []batchWithKind{del, update, del}, rowsPerOp: []int{129, 1, 129}, want: []string{"del", "upd"}, failure: "clear"},
 		{name: "keyless_insert", ops: []batchWithKind{insert}, fakePK: true},
 		{name: "keyless_update", ops: []batchWithKind{oldUpdate, update}, want: []string{"del"}, fakePK: true},
 		{name: "first_create_failure", ops: []batchWithKind{insert, update}, want: []string{"upd"}, failure: "create_first"},
-		{name: "second_create_failure", ops: []batchWithKind{update, del}, want: []string{"upd", "del"}, failure: "create_second"},
+		{name: "second_create_failure", ops: []batchWithKind{update, del}, rowsPerOp: []int{1, 129}, want: []string{"upd", "del"}, failure: "create_second"},
 		{name: "apply_failure", ops: []batchWithKind{insert, update}, failure: "apply"},
 		{name: "cleanup_failure", ops: []batchWithKind{update}, want: []string{"upd"}, failure: "cleanup"},
 		{name: "preserve_apply_error", ops: []batchWithKind{update, insert}, want: []string{"upd"}, failure: "apply_and_cleanup"},
@@ -88,6 +97,12 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 				tbl.def.commonVisibleIdxes = append(tbl.def.commonVisibleIdxes, idx)
 				tbl.def.commonWritableIdxes = append(tbl.def.commonWritableIdxes, idx)
 			}
+			if tc.deleteKeys > 0 {
+				tbl.def.pkColIdxes = nil
+				for _, idx := range tbl.def.writableIdxes[:tc.deleteKeys] {
+					tbl.def.pkColIdxes = append(tbl.def.pkColIdxes, idx)
+				}
+			}
 			if tc.fakePK {
 				tbl = newFakePKBranchTableStuff(ctrl)
 				tbl.retPool = &retBatchList{}
@@ -107,6 +122,12 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 			bh.EXPECT().Exec(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, sql string) error {
 				match := stageName.FindStringSubmatch(sql)
 				if match == nil {
+					if strings.HasPrefix(sql, "delete from ") {
+						loads["inline_delete"]++
+						if tc.failure == "apply" {
+							return injected
+						}
+					}
 					if strings.HasPrefix(sql, "update ") && strings.Contains(sql, "join (values ") {
 						loads["inline"]++
 						if tc.failure == "apply" {
@@ -218,6 +239,10 @@ func TestOnlineMergeCreatesOnlyConsumedStages(t *testing.T) {
 			for _, kind := range tc.want {
 				require.Equal(t, 1, created[kind], kind)
 				require.Equal(t, 2, dropped[kind], "one initial DROP and one cleanup for %s", kind)
+			}
+			require.Equal(t, tc.inlineDeletes, loads["inline_delete"])
+			if tc.name == "delete_between_staged" {
+				require.Equal(t, 2, loads["del"])
 			}
 			require.Empty(t, ready)
 			require.Empty(t, dirty)
