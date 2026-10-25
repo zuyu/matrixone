@@ -1216,7 +1216,8 @@ func hashDiffIfHasLCA(
 				tblStuff.retPool.releaseRetBatch(wrapped.batch, false)
 				return nil
 			}
-			wrapped.batch.Shrink(keep, true)
+			// keep contains the regular updates, not rows to remove.
+			wrapped.batch.Shrink(keep, false)
 		}
 		if copt.conflictOpt != nil && copt.conflictOpt.Opt == tree.CONFLICT_ACCEPT &&
 			copt.expandUpdate && wrapped.kind == diffInsert && wrapped.fromUpdate &&
@@ -1826,6 +1827,9 @@ func dataBranchUpdateRequiresNativeUpdateFromTuples(
 	return false, nil
 }
 
+// Bound coalesced SQL parsing while retaining the existing adaptive memory limit.
+const maxCoalescedLCAProbeRows = 1024
+
 func findDeleteAndUpdateBat(
 	ctx context.Context, ses *Session, bh BackgroundExec,
 	tblStuff tableStuff, tblName string, side int, deliver func(batchWithKind) error, branchTS types.TS,
@@ -1840,7 +1844,7 @@ func findDeleteAndUpdateBat(
 		maxTombstoneBatchCnt = maxSqlBatchCnt
 	}
 
-	if err = tombstoneHashmap.ForEachShardParallel(func(cursor databranchutils.ShardCursor) error {
+	consume := func(forEach func(func(key, row []byte) error) error) error {
 		var (
 			err2  error
 			tuple types.Tuple
@@ -2105,7 +2109,7 @@ func findDeleteAndUpdateBat(
 			return nil
 		}
 
-		if err2 = cursor.ForEach(func(key []byte, row []byte) error {
+		if err2 = forEach(func(key []byte, row []byte) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -2160,11 +2164,23 @@ func findDeleteAndUpdateBat(
 		}
 		return nil
 
-	}, parallelism); err != nil {
-		return
 	}
 
-	return nil
+	// Serial branch operations share one probe buffer across small shards.
+	// Copying keys/rowids into tBat1 keeps them valid after a cursor is released.
+	// Keep large inputs and parallel consumers on their existing per-shard
+	// path; respect the memory-derived batch limit as well as the SQL size cap.
+	if parallelism == 1 && tombstoneHashmap.ItemCount() <= maxCoalescedLCAProbeRows &&
+		tombstoneHashmap.ItemCount() <= int64(maxTombstoneBatchCnt) {
+		return consume(func(visit func(key, row []byte) error) error {
+			return tombstoneHashmap.ForEachShardParallel(func(cursor databranchutils.ShardCursor) error {
+				return cursor.ForEach(visit)
+			}, 1)
+		})
+	}
+	return tombstoneHashmap.ForEachShardParallel(func(cursor databranchutils.ShardCursor) error {
+		return consume(cursor.ForEach)
+	}, parallelism)
 }
 
 func appendTupleToBat(ses *Session, bat *batch.Batch, tuple types.Tuple, tblStuff tableStuff) error {
