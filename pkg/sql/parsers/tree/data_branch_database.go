@@ -16,11 +16,17 @@ type DataBranchDatabase struct {
 	statementImpl
 	Operation            string
 	Source, Destination  TableName
+	Before               TableName
 	Tables, IgnoreTables IdentifierList
 	ConflictOpt          *ConflictOpt
 }
 
-func (s *DataBranchDatabase) StmtKind() StmtKind { return compositeResRowType }
+func (s *DataBranchDatabase) StmtKind() StmtKind {
+	if s.Operation == "reset" || s.Operation == "revert" {
+		return frontendStatusTyp
+	}
+	return compositeResRowType
+}
 func (s *DataBranchDatabase) GetStatementType() string {
 	return "data branch " + s.Operation + " database"
 }
@@ -31,13 +37,23 @@ func (s *DataBranchDatabase) Free()                {}
 func (s *DataBranchDatabase) Format(ctx *FmtCtx) {
 	formatDataBranchStatement(ctx, func() {
 		ctx.WriteString("data branch " + s.Operation + " database ")
-		s.Source.Format(ctx)
-		if s.Operation == "diff" {
-			ctx.WriteString(" against ")
+		if s.Operation == "reset" || s.Operation == "revert" {
+			s.Destination.Format(ctx)
+			ctx.WriteString(" from ")
+			s.Source.Format(ctx)
+			if s.Operation == "revert" {
+				ctx.WriteString(" against ")
+				s.Before.Format(ctx)
+			}
 		} else {
-			ctx.WriteString(" into ")
+			s.Source.Format(ctx)
+			if s.Operation == "diff" {
+				ctx.WriteString(" against ")
+			} else {
+				ctx.WriteString(" into ")
+			}
+			s.Destination.Format(ctx)
 		}
-		s.Destination.Format(ctx)
 		if len(s.Tables) > 0 {
 			ctx.WriteString(" tables (")
 			s.Tables.Format(ctx)
@@ -51,6 +67,8 @@ func (s *DataBranchDatabase) Format(ctx *FmtCtx) {
 		if s.ConflictOpt != nil {
 			s.ConflictOpt.Format(ctx)
 		}
-		ctx.WriteString(" output summary")
+		if s.Operation == "diff" || s.Operation == "merge" {
+			ctx.WriteString(" output summary")
+		}
 	})
 }

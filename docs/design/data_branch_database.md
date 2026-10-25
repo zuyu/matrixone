@@ -52,3 +52,45 @@ outside its transaction unless the caller supplies a supported explicit one.
 Database operations reuse the native table diff/merge workers. A merge still
 performs one HashDiff per selected table; the interface removes per-table
 client round trips, not the underlying per-table work.
+
+## In-place RESET and inverse REVERT
+
+```sql
+DATA BRANCH RESET DATABASE destination_db
+  FROM source_db{snapshot='desired_state'}
+  [TABLES (t1, t2) | IGNORE TABLES (metadata_table)];
+
+DATA BRANCH REVERT DATABASE destination_db
+  FROM source_db{snapshot='after'}
+  AGAINST previous_db{snapshot='before'}
+  [TABLES (t1, t2) | IGNORE TABLES (metadata_table)];
+```
+
+RESET makes the selected tables equal to the historical source. REVERT undoes
+only the difference between `after` and `before`: rows inserted in that window
+are removed; rows deleted or updated in that window get their before image.
+Other keys, including later inserts, are preserved. If a later edit touches a
+key in the reverted change, its before image wins. Both commands return status,
+require historical sources and a current destination, and allow a source from
+another database or from a database that has since been dropped.
+
+These are data operations: selected tables must exist at every endpoint, have
+the same primary-key columns, and have matching writable column names. They
+do not rewind schema. A caller can reconcile schema first. Generated columns
+are recomputed by normal DML. REVERT requires primary keys; RESET also supports
+tables without a primary key by replacing their full row multiset.
+
+For primary-key tables the server uses snapshot joins to materialize only
+removed keys and rows needing restoration in transaction-owned staging tables.
+It then deletes, updates and inserts into the existing destination relations,
+preserving table identity and branch lineage. Snapshot comparisons scan the
+endpoints; this is not an incremental storage-level restore. Keyless RESET
+stages the full source. Staging tables are dropped before the operation finishes.
+No changed rows or keys are sent to the client.
+
+All table schemas and privileges are checked before staging, and every delta
+is staged before the first destination mutation. Normal constraints still
+apply. Any error in autocommit mode rolls back the complete data operation;
+explicit transactions retain commit/rollback control. Application commit logs
+are not interpreted by MO and should be excluded using the table-selection
+clauses.

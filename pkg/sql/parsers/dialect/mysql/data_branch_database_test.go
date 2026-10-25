@@ -20,6 +20,8 @@ import (
 
 func TestDataBranchDatabaseSummarySyntax(t *testing.T) {
 	for _, query := range []string{
+		"data branch reset database d from d{snapshot='old'} tables (a,b)",
+		"data branch revert database d from s{snapshot='after'} against s{snapshot='before'} ignore tables (_bb_commits)",
 		"data branch diff database a against b output summary",
 		"data branch diff database `source db`{snapshot='old'} against d tables (`a b`, c) output summary",
 		"data branch merge database s into d ignore tables (`_bb_commits`) when conflict skip output summary",

@@ -1,0 +1,301 @@
+// Copyright 2026 Matrix Origin
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package frontend
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+)
+
+type branchRestorePlan struct {
+	destination             string
+	columns, keys           []string
+	rowsTable, deletesTable string
+	rowsQuery, deletesQuery string
+}
+
+// RESET restores data without replacing relation identities. REVERT applies
+// the inverse of after-vs-before to current rows, leaving other keys alone.
+// Staging and apply remain inside one owner transaction and never return rows
+// or primary keys to the client.
+func handleBranchRestore(execCtx *ExecCtx, ses *Session, stmt *tree.DataBranchDatabase) (err error) {
+	ctx := execCtx.reqCtx
+	if dataBranchMergeTxnNotAllowed(ses) {
+		return moerr.NewInternalError(ctx, dataBranchMergePickTxnErrorInfo())
+	}
+	if stmt.Source.SchemaName != "" || stmt.Destination.SchemaName != "" || stmt.Before.SchemaName != "" {
+		return moerr.NewInvalidInputNoCtx("DATA BRANCH DATABASE endpoints must be database names")
+	}
+	if len(stmt.Tables) > 0 && len(stmt.IgnoreTables) > 0 {
+		return moerr.NewInvalidInputNoCtx("TABLES and IGNORE TABLES cannot be combined")
+	}
+	if stmt.Destination.AtTsExpr != nil || stmt.Source.AtTsExpr == nil ||
+		(stmt.Operation == "revert" && stmt.Before.AtTsExpr == nil) {
+		return moerr.NewInvalidInputNoCtx("RESET/REVERT require historical source endpoints and a current destination")
+	}
+	bh, finish, err := getDataBranchMutationExecutor(ctx, ses, false,
+		&BackgroundExecOption{forcePessimisticRC: true})
+	if err != nil {
+		return err
+	}
+	defer finishDataBranchComponent(ctx, finish, &err)
+	source, err := branchDatabaseTables(ctx, ses, bh, stmt.Source)
+	if err != nil {
+		return err
+	}
+	destination, err := branchDatabaseTables(ctx, ses, bh, stmt.Destination)
+	if err != nil {
+		return err
+	}
+	before := source
+	if stmt.Operation == "revert" {
+		before, err = branchDatabaseTables(ctx, ses, bh, stmt.Before)
+		if err != nil {
+			return err
+		}
+	}
+	names, err := selectBranchDatabaseTables(stmt, source, destination)
+	if err != nil {
+		return err
+	}
+	if stmt.Operation == "revert" && len(stmt.Tables) == 0 {
+		// Include before-only tables in validation; never silently ignore a
+		// table deletion that this data-only operation cannot restore.
+		union := make(map[string]bool)
+		for name := range source {
+			union[name] = true
+		}
+		for name := range before {
+			union[name] = true
+		}
+		names, err = selectBranchDatabaseTables(stmt, union, destination)
+		if err != nil {
+			return err
+		}
+	}
+	plans := make([]branchRestorePlan, 0, len(names))
+	for _, name := range names {
+		if !source[name] || !destination[name] || !before[name] {
+			return moerr.NewInvalidInputNoCtxf("database %s requires table %q at every endpoint; reconcile schema or select TABLES first", stmt.Operation, name)
+		}
+		src, dst := branchDatabaseTable(stmt.Source, name), branchDatabaseTable(stmt.Destination, name)
+		if !skipDataBranchPrivilegeCheck(ses) {
+			if _, err = authenticateDataBranchReadWriteTables(ctx, ses, src, dst); err != nil {
+				return err
+			}
+			if stmt.Operation == "revert" {
+				if _, err = requireBranchReadOnTableName(ctx, ses, branchDatabaseTable(stmt.Before, name)); err != nil {
+					return err
+				}
+			}
+		}
+		p, err := planBranchRestore(ctx, ses, bh, stmt, name)
+		if err != nil {
+			return err
+		}
+		plans = append(plans, p)
+	}
+	var stages []string
+	defer func() {
+		for i := len(stages) - 1; i >= 0; i-- {
+			if cleanupErr := bh.Exec(ctx, "drop table if exists "+stages[i]); cleanupErr != nil {
+				err = errors.Join(err, cleanupErr)
+			}
+		}
+	}()
+	// Materialize every delta before writing any destination. The temporary
+	// relations also avoid MySQL's same-table DELETE snapshot subquery limit.
+	for _, p := range plans {
+		for _, stage := range [][2]string{{p.rowsTable, p.rowsQuery}, {p.deletesTable, p.deletesQuery}} {
+			if stage[1] == "" {
+				continue
+			}
+			if err = bh.Exec(ctx, "create table "+stage[0]+" as "+stage[1]); err != nil {
+				return err
+			}
+			stages = append(stages, stage[0])
+		}
+	}
+	for _, p := range plans {
+		for _, sql := range p.applySQL() {
+			if err = bh.Exec(ctx, sql); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func branchRestoreTableSQL(table tree.TableName) string {
+	return tree.StringWithOpts(&table, dialect.MYSQL, tree.WithQuoteIdentifier(), tree.WithSingleQuoteString())
+}
+
+func branchRestoreColumns(alias string, names []string) string {
+	parts := make([]string, len(names))
+	for i, name := range names {
+		parts[i] = alias + "." + quoteIdentifierForSQL(name)
+	}
+	return strings.Join(parts, ",")
+}
+
+func branchRestoreJoin(left, right string, keys []string) string {
+	parts := make([]string, len(keys))
+	for i, name := range keys {
+		q := quoteIdentifierForSQL(name)
+		parts[i] = left + "." + q + "=" + right + "." + q
+	}
+	return strings.Join(parts, " and ")
+}
+
+func branchRestoreDifferent(left, right string, columns, keys []string) string {
+	var parts []string
+	for _, name := range columns {
+		if slices.Contains(keys, name) {
+			continue
+		}
+		q := quoteIdentifierForSQL(name)
+		parts = append(parts, "not ("+left+"."+q+" <=> "+right+"."+q+")")
+	}
+	if len(parts) == 0 {
+		return "false"
+	}
+	return "(" + strings.Join(parts, " or ") + ")"
+}
+
+func branchRestoreWritableColumns(def *plan.TableDef) []string {
+	var names []string
+	for _, col := range def.Cols {
+		if isDataBranchWritableColumn(col) {
+			names = append(names, col.Name)
+		}
+	}
+	return names
+}
+
+func planBranchRestore(ctx context.Context, ses *Session, bh BackgroundExec, stmt *tree.DataBranchDatabase, table string) (branchRestorePlan, error) {
+	p := branchRestorePlan{}
+	srcName, dstName := branchDatabaseTable(stmt.Source, table), branchDatabaseTable(stmt.Destination, table)
+	src, dst, srcSnapshot, _, err := getRelations(ctx, ses, bh, srcName, dstName)
+	if err != nil {
+		return p, err
+	}
+	// CTAS executes its SELECT through the internal executor, which has no
+	// session snapshot-name resolver. Scope was validated by getRelations;
+	// use the resolved timestamp in generated SQL, as clone/restore do.
+	if srcSnapshot != nil && srcSnapshot.TS != nil {
+		srcName.AtTsExpr = newMoTimestampHint(srcSnapshot.TS.PhysicalTime)
+	}
+	srcDef, dstDef := src.GetTableDef(ctx), dst.GetTableDef(ctx)
+	dstKind, dstKeys := dataBranchPrimaryKeyColumns(dstDef)
+	srcKind, srcKeys := dataBranchPrimaryKeyColumns(srcDef)
+	if dstKind != srcKind || !slices.Equal(dstKeys, srcKeys) {
+		return p, moerr.NewInvalidInputNoCtxf("database %s primary keys differ for table %q", stmt.Operation, table)
+	}
+	p.columns = branchRestoreWritableColumns(dstDef)
+	checkColumns := func(def *plan.TableDef) error {
+		names := branchRestoreWritableColumns(def)
+		if len(names) != len(p.columns) {
+			return moerr.NewInvalidInputNoCtxf("database %s requires matching writable columns for table %q", stmt.Operation, table)
+		}
+		for _, name := range p.columns {
+			if !slices.Contains(names, name) {
+				return moerr.NewInvalidInputNoCtxf("database %s requires matching writable columns for table %q", stmt.Operation, table)
+			}
+		}
+		return nil
+	}
+	if err = checkColumns(srcDef); err != nil {
+		return p, err
+	}
+	if len(p.columns) == 0 {
+		return p, moerr.NewNotSupportedNoCtxf("table %q has no writable columns", table)
+	}
+	p.destination = branchRestoreTableSQL(dstName)
+	id := strings.ReplaceAll(uuid.NewString(), "-", "")
+	p.rowsTable = qualifiedTableName(stmt.Destination.ObjectName.String(), "__mo_branch_restore_"+id+"_r")
+	p.deletesTable = qualifiedTableName(stmt.Destination.ObjectName.String(), "__mo_branch_restore_"+id+"_d")
+	if dstKind == fakeKind {
+		if stmt.Operation == "revert" {
+			return p, moerr.NewNotSupportedNoCtxf("database REVERT requires a primary key on table %q", table)
+		}
+		p.rowsQuery = "select " + branchRestoreColumns("s", p.columns) + " from " + branchRestoreTableSQL(srcName) + " s"
+		return p, nil
+	}
+	p.keys = dstKeys
+	firstKey := quoteIdentifierForSQL(p.keys[0])
+	if stmt.Operation == "reset" {
+		source := branchRestoreTableSQL(srcName)
+		join := branchRestoreJoin("s", "d", p.keys)
+		p.rowsQuery = fmt.Sprintf("select %s from %s s left join %s d on %s where d.%s is null or %s",
+			branchRestoreColumns("s", p.columns), source, p.destination, join, firstKey, branchRestoreDifferent("s", "d", p.columns, p.keys))
+		p.deletesQuery = fmt.Sprintf("select %s from %s d left join %s s on %s where s.%s is null",
+			branchRestoreColumns("d", p.keys), p.destination, source, join, firstKey)
+	} else {
+		beforeName := branchDatabaseTable(stmt.Before, table)
+		before, _, beforeSnapshot, _, err := getRelations(ctx, ses, bh, beforeName, dstName)
+		if err != nil {
+			return p, err
+		}
+		if beforeSnapshot != nil && beforeSnapshot.TS != nil {
+			beforeName.AtTsExpr = newMoTimestampHint(beforeSnapshot.TS.PhysicalTime)
+		}
+		beforeDef := before.GetTableDef(ctx)
+		kind, keys := dataBranchPrimaryKeyColumns(beforeDef)
+		if kind != dstKind || !slices.Equal(keys, p.keys) {
+			return p, moerr.NewInvalidInputNoCtxf("database REVERT primary keys differ for table %q", table)
+		}
+		if err = checkColumns(beforeDef); err != nil {
+			return p, err
+		}
+		afterSQL, beforeSQL := branchRestoreTableSQL(srcName), branchRestoreTableSQL(beforeName)
+		join := branchRestoreJoin("a", "b", p.keys)
+		p.rowsQuery = fmt.Sprintf("select %s from %s b left join %s a on %s where a.%s is null or %s",
+			branchRestoreColumns("b", p.columns), beforeSQL, afterSQL, join, firstKey, branchRestoreDifferent("a", "b", p.columns, p.keys))
+		p.deletesQuery = fmt.Sprintf("select %s from %s a left join %s b on %s where b.%s is null",
+			branchRestoreColumns("a", p.keys), afterSQL, beforeSQL, join, firstKey)
+	}
+	return p, nil
+}
+
+func (p branchRestorePlan) applySQL() []string {
+	columns := joinQuotedColumnNames(p.columns)
+	if len(p.keys) == 0 {
+		// A WHERE clause keeps this as row DML; an unrestricted DELETE is
+		// optimized into TRUNCATE, which replaces identity and breaks lineage.
+		return []string{"delete from " + p.destination + " where true",
+			fmt.Sprintf("insert into %s (%s) select %s from %s", p.destination, columns, columns, p.rowsTable)}
+	}
+	join := branchRestoreJoin("d", "s", p.keys)
+	sqls := []string{fmt.Sprintf("delete d from %s d inner join %s s on %s", p.destination, p.deletesTable, join)}
+	var assignments []string
+	for _, name := range p.columns {
+		if slices.Contains(p.keys, name) {
+			continue
+		}
+		q := quoteIdentifierForSQL(name)
+		assignments = append(assignments, "d."+q+"=s."+q)
+	}
+	if len(assignments) > 0 {
+		sqls = append(sqls, fmt.Sprintf("update %s d inner join %s s on %s set %s", p.destination, p.rowsTable, join, strings.Join(assignments, ",")))
+	}
+	sqls = append(sqls, fmt.Sprintf("insert into %s (%s) select %s from %s s left join %s d on %s where d.%s is null",
+		p.destination, columns, branchRestoreColumns("s", p.columns), p.rowsTable, p.destination, join, quoteIdentifierForSQL(p.keys[0])))
+	return sqls
+}

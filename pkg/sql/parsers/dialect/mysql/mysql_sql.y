@@ -10614,6 +10614,14 @@ branch_stmt:
 	t.DatabaseName = tree.Identifier($5)
 	$$ = t
     }
+|   DATA BRANCH RESET DATABASE table_name FROM table_name branch_database_tables_opt branch_database_ignore_opt
+    {
+        $$ = &tree.DataBranchDatabase{Operation: "reset", Destination: *$5, Source: *$7, Tables: $8, IgnoreTables: $9}
+    }
+|   DATA BRANCH REVERT DATABASE table_name FROM table_name AGAINST table_name branch_database_tables_opt branch_database_ignore_opt
+    {
+        $$ = &tree.DataBranchDatabase{Operation: "revert", Destination: *$5, Source: *$7, Before: *$9, Tables: $10, IgnoreTables: $11}
+    }
 |   DATA BRANCH DIFF DATABASE table_name AGAINST table_name branch_database_tables_opt branch_database_ignore_opt OUTPUT SUMMARY
     {
         $$ = &tree.DataBranchDatabase{Operation: "diff", Source: *$5, Destination: *$7, Tables: $8, IgnoreTables: $9}
@@ -16717,6 +16725,7 @@ non_reserved_keyword:
 |   CASCADE
 |   DAEMON
 |   DATA
+|   REVERT
 |   DIFF
 |	DAY
 |   DATETIME

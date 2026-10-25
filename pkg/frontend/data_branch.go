@@ -472,6 +472,9 @@ func handleDataBranch(
 	case *tree.DataBranchDeleteDatabase:
 		return stats, dataBranchDeleteDatabase(execCtx, ses, st)
 	case *tree.DataBranchDatabase:
+		if st.Operation == "reset" || st.Operation == "revert" {
+			return stats, handleBranchRestore(execCtx, ses, st)
+		}
 		return stats, handleBranchDatabase(execCtx, ses, st)
 	case *tree.DataBranchDiff:
 		return stats, handleBranchDiff(execCtx, ses, st)

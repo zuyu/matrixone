@@ -777,6 +777,7 @@ func init() {
 		"fail":                     CONFLICT_FAIL,
 		"skip":                     CONFLICT_SKIP,
 		"accept":                   CONFLICT_ACCEPT,
+		"revert":                   REVERT,
 		"diff":                     DIFF,
 		"pick":                     PICK,
 		"conflict":                 CONFLICT,
