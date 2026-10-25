@@ -1136,6 +1136,15 @@ func hashDiffIfHasLCA(
 
 	handleBaseDeleteAndUpdates := func(wrapped batchWithKind) error {
 		wrapped.side = diffSideBase
+		if copt.mergeSummary != nil && !(wrapped.kind == diffDelete && wrapped.fromUpdate) {
+			logical := wrapped
+			if logical.kind == diffInsert {
+				logical.kind = diffUpdate
+			}
+			if err := copt.mergeSummary.observe(ses, tblStuff, logical); err != nil {
+				return err
+			}
+		}
 		if err2 := sortDataBranchBatchByPrimaryKey(
 			wrapped.batch, tblStuff.def.pkColIdx, ses.proc.Mp(),
 		); err2 != nil {
@@ -1155,6 +1164,15 @@ func hashDiffIfHasLCA(
 
 	handleTarDeleteAndUpdates := func(wrapped batchWithKind) (err2 error) {
 		wrapped.side = diffSideTarget
+		if copt.mergeSummary != nil {
+			if err2 = copt.mergeSummary.filterEqual(ses, tblStuff, wrapped); err2 != nil {
+				return err2
+			}
+			if wrapped.batch.RowCount() == 0 {
+				tblStuff.retPool.releaseRetBatch(wrapped.batch, false)
+				return nil
+			}
+		}
 		var pickConflictBat *batch.Batch
 		if wrapped.kind == diffInsert && wrapped.fromUpdate && len(restoreMissingKeys) > 0 {
 			var keep []int64
@@ -1482,7 +1500,7 @@ func hashDiffIfHasLCA(
 					case tmpCh <- wrapped:
 						return nil
 					}
-				}, branchTS, copt.expandUpdate, hashmap1, hashmap2, -1,
+				}, branchTS, copt.expandUpdate, hashmap1, hashmap2, -1, nil,
 			); err3 != nil {
 				atomicErr.Store(err3)
 			}
@@ -1503,8 +1521,15 @@ func hashDiffIfHasLCA(
 			}
 			// Delivery owns the batch even on failure. Held batches remain in
 			// retPool until the agency unwinds; handlers release emitted failures.
+			var observeLogical func(batchWithKind) error
+			if !forBase && copt.mergeSummary != nil {
+				observeLogical = func(w batchWithKind) error {
+					return copt.mergeSummary.observeSourceChanges(ctx, ses, tblStuff, w,
+						baseDeleteBatches, baseUpdateBatches)
+				}
+			}
 			return findDeleteAndUpdateBat(ctx, ses, bh, tblStuff, name, side,
-				handle, branchTS, copt.expandUpdate, hashmap1, hashmap2, 1)
+				handle, branchTS, copt.expandUpdate, hashmap1, hashmap2, 1, observeLogical)
 		}
 
 		var (
@@ -1807,6 +1832,7 @@ func findDeleteAndUpdateBat(
 	expandUpdate bool,
 	dataHashmap, tombstoneHashmap databranchutils.BranchHashmap,
 	parallelism int,
+	observeLogical func(batchWithKind) error,
 ) (err error) {
 
 	maxTombstoneBatchCnt := tblStuff.maxTombstoneBatchCnt
@@ -1996,6 +2022,23 @@ func findDeleteAndUpdateBat(
 
 				tblStuff.retPool.releaseRetBatch(dBat, false)
 				tBat2.SetRowCount(tBat2.Vecs[0].Length())
+
+				// Observe complete logical changes before expanding UPDATEs
+				// or applying a conflict policy that may discard rows.
+				if observeLogical != nil {
+					for _, b := range []*batch.Batch{stagedUpdateBat, nativeUpdateBat} {
+						if b == nil {
+							continue
+						}
+						b.SetRowCount(b.Vecs[0].Length())
+						if err2 = observeLogical(batchWithKind{batch: b, kind: diffUpdate, name: tblName, side: side}); err2 != nil {
+							return err2
+						}
+					}
+					if err2 = observeLogical(batchWithKind{batch: tBat2, kind: diffDelete, name: tblName, side: side}); err2 != nil {
+						return err2
+					}
+				}
 
 				if stagedUpdateBat != nil || nativeUpdateBat != nil {
 					if expandUpdate {
@@ -2449,6 +2492,11 @@ func diffDataHelper(
 					return err2
 				}
 
+				if copt.mergeSummary != nil {
+					if err2 = copt.mergeSummary.observeInsert(ses, tblStuff, tarTuple, diffSideTarget); err2 != nil {
+						return err2
+					}
+				}
 				if err2 = appendTupleToBat(ses, tarBat, tarTuple, tblStuff); err2 != nil {
 					return err2
 				}
@@ -2495,6 +2543,14 @@ func diffDataHelper(
 					}
 
 					if notSame {
+						if copt.mergeSummary != nil {
+							if err2 = copt.mergeSummary.observeInsert(ses, tblStuff, tarTuple, diffSideTarget); err2 != nil {
+								return err2
+							}
+							if err2 = copt.mergeSummary.observeInsert(ses, tblStuff, baseTuple, diffSideBase); err2 != nil {
+								return err2
+							}
+						}
 						if copt.conflictOpt != nil &&
 							copt.conflictOpt.Opt == tree.CONFLICT_ACCEPT &&
 							copt.expandUpdate {
@@ -2623,7 +2679,10 @@ func diffDataHelper(
 
 	if copt.conflictOpt != nil {
 		if !copt.outputSQL {
-			// merge doesnt need the base data
+			// Destination-only inserts affect statistics, never apply.
+			if copt.mergeSummary != nil {
+				return copt.mergeSummary.observeDestinationInserts(ctx, ses, tblStuff, baseDataHashmap)
+			}
 			return nil
 		}
 	}

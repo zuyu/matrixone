@@ -15,8 +15,9 @@
 package frontend
 
 import (
-	"github.com/stretchr/testify/require"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestDataBranchMergeSummaryConflictKeys(t *testing.T) {
@@ -37,6 +38,7 @@ func TestDataBranchMergeSummaryConflictKeys(t *testing.T) {
 		s.observeKey("source-only", diffSideTarget, diffInsert)
 		s.observeKey("destination-only", diffSideBase, diffUpdate)
 		require.Equal(t, uint64(4), s.conflicts)
+		require.Len(t, s.keys, 2, "matched keys should be released as soon as both sides arrive")
 		s.releaseKeys()
 		require.Nil(t, s.keys)
 	}

@@ -388,6 +388,7 @@ func mergeDiffs(
 	bh BackgroundExec,
 	tblStuff tableStuff,
 	produce func(emitFunc) error,
+	lazyInit bool,
 ) (err error) {
 
 	var (
@@ -413,19 +414,45 @@ func mergeDiffs(
 		ctx, ses, bh, tblStuff, dataBranchApplyModeOnlineMerge,
 		&deleteCnt, deleteFromVals, &insertCnt, insertIntoVals, nil,
 	)
-	if err = initApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile); err != nil {
-		return err
+
+	initialized := false
+	initialize := func() error {
+		if err := initApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile); err != nil {
+			return err
+		}
+		initialized = true
+		return nil
+	}
+	if !lazyInit {
+		if err = initialize(); err != nil {
+			return err
+		}
 	}
 	defer func() {
-		if err2 := dropApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile); err2 != nil && err == nil {
-			err = err2
+		if initialized {
+			if err2 := dropApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile); err2 != nil && err == nil {
+				err = err2
+			}
 		}
 	}()
 
+	// Summary matching can eliminate every source change. Its serial
+	// owner delays stage DDL until the first nonempty apply batch, so a
+	// no-op still needs no stages. Ordinary MERGE keeps eager preparation.
 	// Successful delivery transfers the batch; emitBatch releases failures.
 	if err = produce(func(wrapped batchWithKind) (bool, error) {
 		if err := ctx.Err(); err != nil {
 			return false, err
+		}
+
+		if wrapped.batch.RowCount() == 0 {
+			tblStuff.retPool.releaseRetBatch(wrapped.batch, false)
+			return false, nil
+		}
+		if !initialized {
+			if err := initialize(); err != nil {
+				return false, err
+			}
 		}
 		if err := appendBatchRowsAsSQLValues(ctx, ses, tblStuff, wrapped, tmpValsBuffer, appender); err != nil {
 			return false, err
@@ -434,6 +461,9 @@ func mergeDiffs(
 		return false, nil
 	}); err != nil {
 		return err
+	}
+	if !initialized {
+		return nil
 	}
 	return appender.flushAll()
 }

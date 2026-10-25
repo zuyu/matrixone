@@ -3368,9 +3368,10 @@ func buildFakePKInsertBatchWithoutFakePKValue(t *testing.T, mp *mpool.MPool, row
 }
 
 func TestOnlineBranchApplyOrdersPreparationProductionAndCleanup(t *testing.T) {
-	for _, pick := range []bool{false, true} {
-		for _, failure := range []string{"", "init", "producer", "apply", "cancel"} {
-			t.Run(fmt.Sprintf("pick=%v/%s", pick, failure), func(t *testing.T) {
+	for _, mode := range []struct{ pick, lazy bool }{{}, {lazy: true}, {pick: true}} {
+		pick, lazy := mode.pick, mode.lazy
+		for _, failure := range []string{"", "empty", "init", "producer", "apply", "cancel"} {
+			t.Run(fmt.Sprintf("pick=%v/lazy=%v/%s", pick, lazy, failure), func(t *testing.T) {
 				ses := newValidateSession(t)
 				ctrl := gomock.NewController(t)
 				tblStuff := newTestBranchTableStuff(ctrl)
@@ -3386,7 +3387,7 @@ func TestOnlineBranchApplyOrdersPreparationProductionAndCleanup(t *testing.T) {
 				bh.EXPECT().Exec(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, sql string) error {
 					events = append(events, sql)
 					if strings.HasPrefix(sql, "create table") {
-						require.False(t, produced, "stage refresh/drain precedes producer SQL")
+						require.Equal(t, lazy, produced, "only a serial summary producer may defer stage initialization")
 						creates++
 						if failure == "init" {
 							return injected
@@ -3404,7 +3405,14 @@ func TestOnlineBranchApplyOrdersPreparationProductionAndCleanup(t *testing.T) {
 				bh.EXPECT().ClearExecResultSet().AnyTimes()
 				produce := func(emit emitFunc) error {
 					produced = true
-					require.Equal(t, 3, creates)
+					if lazy {
+						require.Zero(t, creates)
+					} else {
+						require.Equal(t, 3, creates)
+					}
+					if failure == "empty" {
+						return nil
+					}
 					for _, fromUpdate := range []bool{false, true} {
 						bat := tblStuff.retPool.acquireRetBatch(tblStuff, false)
 						require.NoError(t, vector.AppendFixed(bat.Vecs[0], int64(1), false, ses.proc.Mp()))
@@ -3430,10 +3438,10 @@ func TestOnlineBranchApplyOrdersPreparationProductionAndCleanup(t *testing.T) {
 				if pick {
 					err = pickMergeDiffs(ctx, cancel, ses, bh, &tree.DataBranchPick{ConflictOpt: &tree.ConflictOpt{Opt: tree.CONFLICT_ACCEPT}}, tblStuff, produce)
 				} else {
-					err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce)
+					err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce, lazy)
 				}
 				switch failure {
-				case "":
+				case "", "empty":
 					require.NoError(t, err)
 				case "cancel":
 					require.ErrorIs(t, err, context.Canceled)
@@ -3441,7 +3449,9 @@ func TestOnlineBranchApplyOrdersPreparationProductionAndCleanup(t *testing.T) {
 					require.ErrorIs(t, err, injected)
 				}
 				if failure == "init" {
-					require.False(t, produced)
+					require.Equal(t, lazy, produced)
+				} else if failure == "empty" && lazy {
+					require.Empty(t, events, "an empty summary must not create or drop stages")
 				} else {
 					require.True(t, strings.HasPrefix(events[len(events)-1], "drop table if exists"), "cleanup runs after production returns")
 				}

@@ -395,4 +395,6 @@ type compositeOption struct {
 	outputSQL             bool
 	expandUpdate          bool
 	preservePickConflicts bool
+	// mergeSummary is observed only by the serial online-apply owner.
+	mergeSummary *dataBranchMergeSummary
 }

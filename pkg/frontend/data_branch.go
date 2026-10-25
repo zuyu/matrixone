@@ -1159,38 +1159,33 @@ func diffMergeAgency(
 	}
 
 	if diffStmt == nil {
-		// The apply owner prepares stages before production and consumes each
-		// batch inline. A retry must never cancel a concurrent LCA probe.
+		// The apply owner serializes probes, stage preparation and writes.
+		// A retry must never cancel a concurrent LCA probe.
 		var summary *dataBranchMergeSummary
 		if mergeStmt != nil && mergeStmt.OutputSummary {
 			summary = newDataBranchMergeSummary()
-			wg.Add(1)
-			// Analyze the same resolved endpoints before apply. This keeps rows
-			// on the server and shares catalog/lineage resolution with MERGE.
-			// A plain logical diff also excludes equal changes on both sides.
-			if err = diffOnBase(ctx, ses, bh, wg, dagInfo, tblStuff,
-				compositeOption{onlineApply: true},
-				func(wrapped batchWithKind) (bool, error) {
-					defer tblStuff.retPool.releaseRetBatch(wrapped.batch, false)
-					return false, summary.observe(ses, tblStuff, wrapped)
-				}, nil, nil, nil, nil); err != nil {
-				return err
-			}
-			summary.releaseKeys()
-			if summary.source == [3]uint64{} {
-				return summary.output(execCtx.reqCtx, ses)
-			}
+			summary.failOnEqualOverlap = copt.conflictOpt != nil && copt.conflictOpt.Opt == tree.CONFLICT_FAIL
+			copt.mergeSummary = summary
+			defer summary.releaseKeys()
 		}
 		copt.onlineApply = true
 		produce := func(emit emitFunc) error {
 			wg.Add(1)
-			return diffOnBase(ctx, ses, bh, wg, dagInfo, tblStuff, copt, emit,
-				pkFilter, pickKeyHashmap, betweenFrom, betweenTo)
+			if err := diffOnBase(ctx, ses, bh, wg, dagInfo, tblStuff, copt, emit,
+				pkFilter, pickKeyHashmap, betweenFrom, betweenTo); err != nil {
+				return err
+			}
+			// Preserve the previous early no-op success under FAIL, while
+			// retaining plain MERGE's overlap error when source changes remain.
+			if summary != nil && summary.source != [3]uint64{} {
+				return summary.equalConflict
+			}
+			return nil
 		}
 		if pickStmt != nil {
 			return pickMergeDiffs(ctx, cancel, ses, bh, pickStmt, tblStuff, produce)
 		}
-		if err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce); err != nil {
+		if err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce, summary != nil); err != nil {
 			return err
 		}
 		if summary != nil {
