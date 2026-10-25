@@ -10631,6 +10631,15 @@ branch_stmt:
     	t.ConflictOpt = $7
     	$$ = t
     }
+|   DATA BRANCH MERGE table_name INTO table_name conflict_opt OUTPUT SUMMARY
+    {
+        t := tree.NewDataBranchMerge()
+        t.SrcTable = *$4
+        t.DstTable = *$6
+        t.ConflictOpt = $7
+        t.OutputSummary = true
+        $$ = t
+    }
 |   DATA BRANCH PICK table_name INTO table_name pick_keys_clause conflict_opt
     {
     	t := tree.NewDataBranchPick()

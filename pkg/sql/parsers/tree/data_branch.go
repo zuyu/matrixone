@@ -458,9 +458,10 @@ func (o *ConflictOpt) Format(ctx *FmtCtx) {
 
 type DataBranchMerge struct {
 	statementImpl
-	SrcTable    TableName
-	DstTable    TableName
-	ConflictOpt *ConflictOpt
+	SrcTable      TableName
+	DstTable      TableName
+	ConflictOpt   *ConflictOpt
+	OutputSummary bool
 }
 
 func (s *DataBranchMerge) TypeName() string {
@@ -476,6 +477,9 @@ func NewDataBranchMerge() *DataBranchMerge {
 }
 
 func (s *DataBranchMerge) StmtKind() StmtKind {
+	if s.OutputSummary {
+		return compositeResRowType
+	}
 	return frontendStatusTyp
 }
 
@@ -487,6 +491,9 @@ func (s *DataBranchMerge) Format(ctx *FmtCtx) {
 		s.DstTable.Format(ctx)
 		if s.ConflictOpt != nil {
 			s.ConflictOpt.Format(ctx)
+		}
+		if s.OutputSummary {
+			ctx.WriteString(" output summary")
 		}
 	})
 }
