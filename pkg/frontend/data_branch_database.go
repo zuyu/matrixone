@@ -33,6 +33,11 @@ type branchDatabaseResult struct {
 // One owner transaction spans enumeration, authorization and every table.
 // Table workers must never acquire/commit a separate background transaction.
 func handleBranchDatabase(execCtx *ExecCtx, ses *Session, stmt *tree.DataBranchDatabase) (err error) {
+	var timing *dataBranchMergeTiming
+	if stmt.Operation == "merge" {
+		timing = newDataBranchMergeTiming("database", stmt.Source, stmt.Destination, ses)
+		defer timing.finish(&err)
+	}
 	if stmt.Source.SchemaName != "" || stmt.Destination.SchemaName != "" {
 		return moerr.NewInvalidInputNoCtx("DATA BRANCH DATABASE endpoints must be database names")
 	}
@@ -50,50 +55,65 @@ func handleBranchDatabase(execCtx *ExecCtx, ses *Session, stmt *tree.DataBranchD
 			return moerr.NewInvalidInputNoCtx("cannot merge a database into itself")
 		}
 	}
-	bh, finish, err := getDataBranchMutationExecutor(execCtx.reqCtx, ses, false,
-		&BackgroundExecOption{forcePessimisticRC: true})
-	if err != nil {
+	var bh BackgroundExec
+	var finish func(error) error
+	if err = timing.measure("executor_acquire", func() error {
+		var acquireErr error
+		bh, finish, acquireErr = getDataBranchMutationExecutor(execCtx.reqCtx, ses, false,
+			&BackgroundExecOption{forcePessimisticRC: true})
+		return acquireErr
+	}); err != nil {
 		return err
 	}
-	defer finishDataBranchComponent(execCtx.reqCtx, finish, &err)
+	defer finishDataBranchComponent(execCtx.reqCtx, timing.wrapFinish(finish), &err)
 	ctx := execCtx.reqCtx
-	source, err := branchDatabaseTables(ctx, ses, bh, stmt.Source)
-	if err != nil {
-		return err
-	}
-	destination, err := branchDatabaseTables(ctx, ses, bh, stmt.Destination)
-	if err != nil {
-		return err
-	}
-	names, err := selectBranchDatabaseTables(stmt, source, destination)
-	if err != nil {
+	var source, destination map[string]bool
+	var names []string
+	if err = timing.measure("enumerate", func() error {
+		var enumerateErr error
+		source, enumerateErr = branchDatabaseTables(ctx, ses, bh, stmt.Source)
+		if enumerateErr != nil {
+			return enumerateErr
+		}
+		destination, enumerateErr = branchDatabaseTables(ctx, ses, bh, stmt.Destination)
+		if enumerateErr != nil {
+			return enumerateErr
+		}
+		names, enumerateErr = selectBranchDatabaseTables(stmt, source, destination)
+		return enumerateErr
+	}); err != nil {
 		return err
 	}
 	// Authorize the complete set before the first write. Historical endpoints
 	// use the same snapshot-aware read authorization as table-level DIFF.
-	for _, name := range names {
-		src, dst := branchDatabaseTable(stmt.Source, name), branchDatabaseTable(stmt.Destination, name)
-		if stmt.Operation == "merge" && (!source[name] || !destination[name]) {
-			return moerr.NewInvalidInputNoCtxf("database merge requires table %q on both sides; reconcile schema or select TABLES first", name)
-		}
-		if !skipDataBranchPrivilegeCheck(ses) {
-			if stmt.Operation == "merge" {
-				if _, err = authenticateDataBranchReadWriteTables(ctx, ses, src, dst); err != nil {
-					return err
-				}
-			} else {
-				if source[name] {
-					if _, err = requireBranchReadOnTableName(ctx, ses, src); err != nil {
+	if err = timing.measure("authorize", func() error {
+		for _, name := range names {
+			src, dst := branchDatabaseTable(stmt.Source, name), branchDatabaseTable(stmt.Destination, name)
+			if stmt.Operation == "merge" && (!source[name] || !destination[name]) {
+				return moerr.NewInvalidInputNoCtxf("database merge requires table %q on both sides; reconcile schema or select TABLES first", name)
+			}
+			if !skipDataBranchPrivilegeCheck(ses) {
+				if stmt.Operation == "merge" {
+					if _, err = authenticateDataBranchReadWriteTables(ctx, ses, src, dst); err != nil {
 						return err
 					}
-				}
-				if destination[name] {
-					if _, err = requireBranchReadOnTableName(ctx, ses, dst); err != nil {
-						return err
+				} else {
+					if source[name] {
+						if _, err = requireBranchReadOnTableName(ctx, ses, src); err != nil {
+							return err
+						}
+					}
+					if destination[name] {
+						if _, err = requireBranchReadOnTableName(ctx, ses, dst); err != nil {
+							return err
+						}
 					}
 				}
 			}
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	results := make([]branchDatabaseResult, 0, len(names))
 	for _, name := range names {
@@ -116,7 +136,7 @@ func handleBranchDatabase(execCtx *ExecCtx, ses *Session, stmt *tree.DataBranchD
 				policy = &tree.ConflictOpt{Opt: tree.CONFLICT_FAIL}
 			}
 			merge := &tree.DataBranchMerge{SrcTable: src, DstTable: dst, ConflictOpt: policy, OutputSummary: true}
-			err = diffMergeWithExecutor(ses, execCtx, merge, bh, summary)
+			err = diffMergeWithExecutor(ses, execCtx, merge, bh, summary, timing)
 		}
 		summary.releaseKeys()
 		if err != nil {
@@ -124,7 +144,7 @@ func handleBranchDatabase(execCtx *ExecCtx, ses *Session, stmt *tree.DataBranchD
 		}
 		results = append(results, branchDatabaseResult{name, source[name], destination[name], summary})
 	}
-	return outputBranchDatabaseSummary(ctx, ses, results)
+	return timing.measure("summary_output", func() error { return outputBranchDatabaseSummary(ctx, ses, results) })
 }
 
 func branchDatabaseTable(database tree.TableName, name string) tree.TableName {

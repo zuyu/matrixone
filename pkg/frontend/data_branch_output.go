@@ -389,7 +389,12 @@ func mergeDiffs(
 	tblStuff tableStuff,
 	produce func(emitFunc) error,
 	lazyInit bool,
+	timings ...*dataBranchMergeTiming,
 ) (err error) {
+	var timing *dataBranchMergeTiming
+	if len(timings) > 0 {
+		timing = timings[0]
+	}
 
 	var (
 		insertCnt int
@@ -417,7 +422,9 @@ func mergeDiffs(
 
 	initialized := false
 	initialize := func() error {
-		if err := initApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile); err != nil {
+		if err := timing.measure("stage_init", func() error {
+			return initApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile)
+		}); err != nil {
 			return err
 		}
 		initialized = true
@@ -430,7 +437,9 @@ func mergeDiffs(
 	}
 	defer func() {
 		if initialized {
-			if err2 := dropApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile); err2 != nil && err == nil {
+			if err2 := timing.measure("stage_cleanup", func() error {
+				return dropApplyTables(ctx, ses, bh, appender.batchInfo, appender.writeFile)
+			}); err2 != nil && err == nil {
 				err = err2
 			}
 		}
@@ -440,7 +449,7 @@ func mergeDiffs(
 	// owner delays stage DDL until the first nonempty apply batch, so a
 	// no-op still needs no stages. Ordinary MERGE keeps eager preparation.
 	// Successful delivery transfers the batch; emitBatch releases failures.
-	if err = produce(func(wrapped batchWithKind) (bool, error) {
+	if err = timing.produce(produce, func(wrapped batchWithKind) (bool, error) {
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
@@ -454,7 +463,9 @@ func mergeDiffs(
 				return false, err
 			}
 		}
-		if err := appendBatchRowsAsSQLValues(ctx, ses, tblStuff, wrapped, tmpValsBuffer, appender); err != nil {
+		if err := timing.measure("apply", func() error {
+			return appendBatchRowsAsSQLValues(ctx, ses, tblStuff, wrapped, tmpValsBuffer, appender)
+		}); err != nil {
 			return false, err
 		}
 		tblStuff.retPool.releaseRetBatch(wrapped.batch, false)
@@ -465,7 +476,7 @@ func mergeDiffs(
 	if !initialized {
 		return nil
 	}
-	return appender.flushAll()
+	return timing.measure("apply", appender.flushAll)
 }
 
 // resolveProjectedIdxes resolves the user-specified COLUMNS list to the

@@ -3438,7 +3438,24 @@ func TestOnlineBranchApplyOrdersPreparationProductionAndCleanup(t *testing.T) {
 				if pick {
 					err = pickMergeDiffs(ctx, cancel, ses, bh, &tree.DataBranchPick{ConflictOpt: &tree.ConflictOpt{Opt: tree.CONFLICT_ACCEPT}}, tblStuff, produce)
 				} else {
-					err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce, lazy)
+					timing := &dataBranchMergeTiming{now: time.Now, phases: make(map[string]time.Duration)}
+					err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce, lazy, timing)
+					if failure == "empty" && lazy {
+						require.Zero(t, timing.phases["stage_init"])
+						require.Zero(t, timing.phases["apply"])
+						require.Zero(t, timing.phases["stage_cleanup"])
+					} else {
+						require.Positive(t, timing.phases["stage_init"])
+						if failure != "init" {
+							require.Positive(t, timing.phases["stage_cleanup"])
+						}
+					}
+					if failure != "init" || lazy {
+						require.Positive(t, timing.phases["diff"])
+					}
+					if failure == "" || failure == "apply" {
+						require.Positive(t, timing.phases["apply"])
+					}
 				}
 				switch failure {
 				case "", "empty":

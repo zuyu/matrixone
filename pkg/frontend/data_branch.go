@@ -962,24 +962,40 @@ func dataBranchDeleteDatabase(
 }
 
 func diffMergeAgency(ses *Session, execCtx *ExecCtx, stmt tree.Statement) (err error) {
+	var timing *dataBranchMergeTiming
+	if merge, ok := stmt.(*tree.DataBranchMerge); ok {
+		timing = newDataBranchMergeTiming("table", merge.SrcTable, merge.DstTable, ses)
+		defer timing.finish(&err)
+	}
 	if err = validate(execCtx.reqCtx, ses, stmt); err != nil {
 		return err
 	}
 	// Enter the lineage-owner lifecycle before resolving endpoints or staging.
-	bh, deferred, err := getDataBranchMutationExecutor(execCtx.reqCtx, ses, false,
-		&BackgroundExecOption{forcePessimisticRC: true})
-	if err != nil {
+	var bh BackgroundExec
+	var deferred func(error) error
+	if err = timing.measure("executor_acquire", func() error {
+		var acquireErr error
+		bh, deferred, acquireErr = getDataBranchMutationExecutor(execCtx.reqCtx, ses, false,
+			&BackgroundExecOption{forcePessimisticRC: true})
+		return acquireErr
+	}); err != nil {
 		return err
 	}
 	if deferred != nil {
-		defer finishDataBranchComponent(execCtx.reqCtx, deferred, &err)
+		defer finishDataBranchComponent(execCtx.reqCtx, timing.wrapFinish(deferred), &err)
 	}
-	return diffMergeWithExecutor(ses, execCtx, stmt, bh, nil)
+	return diffMergeWithExecutor(ses, execCtx, stmt, bh, nil, timing)
 }
 
 func diffMergeWithExecutor(ses *Session, execCtx *ExecCtx, stmt tree.Statement,
 	bh BackgroundExec, summarySink *dataBranchMergeSummary,
+	timings ...*dataBranchMergeTiming,
 ) (err error) {
+	var timing *dataBranchMergeTiming
+	if merge, ok := stmt.(*tree.DataBranchMerge); ok && len(timings) > 0 {
+		timing = timings[0].table(merge.SrcTable, merge.DstTable)
+		defer timing.finish(&err)
+	}
 	if err = validate(execCtx.reqCtx, ses, stmt); err != nil {
 		return err
 	}
@@ -1036,9 +1052,11 @@ func diffMergeWithExecutor(ses *Session, execCtx *ExecCtx, stmt tree.Statement,
 	} else if mergeStmt != nil {
 		copt.conflictOpt = mergeStmt.ConflictOpt
 		copt.expandUpdate = true
-		if tblStuff, err = getTableStuff(
-			ctx, ses, bh, mergeStmt.SrcTable, mergeStmt.DstTable,
-		); err != nil {
+		if err = timing.measure("relations", func() error {
+			var relationErr error
+			tblStuff, relationErr = getTableStuff(ctx, ses, bh, mergeStmt.SrcTable, mergeStmt.DstTable)
+			return relationErr
+		}); err != nil {
 			return
 		}
 	} else {
@@ -1056,17 +1074,23 @@ func diffMergeWithExecutor(ses *Session, execCtx *ExecCtx, stmt tree.Statement,
 		}
 	}
 
-	if err = prepareDataBranchWorker(diffStmt, pickStmt, &tblStuff); err != nil {
+	if err = timing.measure("prepare_worker", func() error {
+		return prepareDataBranchWorker(diffStmt, pickStmt, &tblStuff)
+	}); err != nil {
 		return
 	}
 	defer tblStuff.worker.Release()
 
-	if dagInfo, err = decideLCABranchTSFromBranchDAG(
-		ctx, ses, bh, tblStuff,
-	); err != nil {
+	if err = timing.measure("lineage", func() error {
+		var lineageErr error
+		dagInfo, lineageErr = decideLCABranchTSFromBranchDAG(ctx, ses, bh, tblStuff)
+		return lineageErr
+	}); err != nil {
 		return
 	}
-	if err = reconcileDataBranchEndpointSchema(ctx, ses, bh, &tblStuff, &dagInfo); err != nil {
+	if err = timing.measure("reconcile_schema", func() error {
+		return reconcileDataBranchEndpointSchema(ctx, ses, bh, &tblStuff, &dagInfo)
+	}); err != nil {
 		return
 	}
 	var (
@@ -1191,11 +1215,11 @@ func diffMergeWithExecutor(ses *Session, execCtx *ExecCtx, stmt tree.Statement,
 		if pickStmt != nil {
 			return pickMergeDiffs(ctx, cancel, ses, bh, pickStmt, tblStuff, produce)
 		}
-		if err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce, summary != nil); err != nil {
+		if err = mergeDiffs(ctx, cancel, ses, bh, tblStuff, produce, summary != nil, timing); err != nil {
 			return err
 		}
 		if summary != nil && summarySink == nil {
-			return summary.output(execCtx.reqCtx, ses)
+			return timing.measure("summary_output", func() error { return summary.output(execCtx.reqCtx, ses) })
 		}
 		return nil
 	}
