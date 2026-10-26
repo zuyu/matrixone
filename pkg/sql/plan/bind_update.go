@@ -5177,6 +5177,14 @@ func (builder *QueryBuilder) appendUpdateFromDedupNode(
 		}
 	}
 
+	if len(partitionColPositions) == 1 {
+		rowID := [2]int32{selectNodeTag, partitionColPositions[0]}
+		if builder.updateInputUniqueProof(lastNodeID).containsKey(map[[2]int32]bool{rowID: true}) {
+			// Every physical target row occurs at most once. Keep the ordinary
+			// null-target guard, locks, changed-row accounting and constraints.
+			return lastNodeID, selectNode, selectNodeTag, nil
+		}
+	}
 	return builder.appendRowNumberDedupNode(bindCtx, lastNodeID, selectNode, selectNodeTag, partitionColPositions)
 }
 
