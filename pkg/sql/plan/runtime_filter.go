@@ -15,6 +15,8 @@
 package plan
 
 import (
+	"math"
+
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/hashmap/keycodec"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
@@ -689,8 +691,7 @@ func (builder *QueryBuilder) generateRuntimeFilters(nodeID int32) {
 		if node.JoinType != plan.Node_INDEX {
 			probeNdv := getExprNdv(probeExprs[0], builder)
 			if probeNdv <= 1 {
-				//maybe not flushed yet, set at least 100 to continue calculation
-				probeNdv = 100
+				probeNdv = runtimeFilterMissingProbeNDV(node, leftChild, probeExprs[0])
 			}
 			if node.Stats.HashmapStats.HashmapSize/probeNdv >= 0.1 {
 				return
@@ -760,6 +761,32 @@ func (builder *QueryBuilder) generateRuntimeFilters(nodeID int32) {
 		}
 		return
 	}
+}
+
+// runtimeFilterMissingProbeNDV supplies a cost estimate when column statistics
+// are unavailable/degenerate. A complete, equality-compatible single-column PK
+// has one distinct value per row. Using the old constant 100 for a newly loaded
+// large table incorrectly rejects selective runtime filters. This estimate
+// does not replace the join predicate or the runtime payload cardinality limit.
+func runtimeFilterMissingProbeNDV(join, probe *plan.Node, expr *plan.Expr) float64 {
+	const fallback = 100
+	// Restrict new admission to ordinary inner joins: other join types may
+	// require local placement or preserve rows on the physical probe side.
+	if join == nil || join.JoinType != plan.Node_INNER || probe == nil ||
+		probe.NodeType != plan.Node_TABLE_SCAN || probe.Stats == nil ||
+		IsDefaultStats(probe.Stats) || probe.Stats.TableCnt <= fallback ||
+		math.IsNaN(probe.Stats.TableCnt) || math.IsInf(probe.Stats.TableCnt, 0) ||
+		len(probe.BindingTags) != 1 || !areTruncationSafePredicates(probe.FilterList) {
+		return fallback
+	}
+	col := expr.GetCol()
+	positions, ok := sqlEqualityCompatiblePrimaryKeyColumnPositions(probe.TableDef)
+	if !ok || len(positions) != 1 || col == nil || col.RelPos != probe.BindingTags[0] ||
+		col.ColPos != positions[0] ||
+		!sqlEqualityJoinUsesOneIdentityDomain(expr.Typ, probe.TableDef.Cols[col.ColPos].Typ) {
+		return fallback
+	}
+	return probe.Stats.TableCnt
 }
 
 // finalizeFuzzyRuntimeFilter makes build-side selection, delivery, and
