@@ -31,6 +31,7 @@ type branchRestorePlan struct {
 	columns, keys           []string
 	rowsTable, deletesTable string
 	rowsQuery, deletesQuery string
+	insertQuery             string
 	rowsEmpty, deletesEmpty bool
 	deleteSubquery          bool
 	rowsSubquery            bool
@@ -264,6 +265,13 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 			branchRestoreColumns("s", p.columns), source, p.destination, join, firstKey, branchRestoreDifferent("s", "d", p.columns, p.keys))
 		p.deletesQuery = fmt.Sprintf("select %s from %s d left join %s s on %s where s.%s is null",
 			branchRestoreColumns("d", p.keys), p.destination, source, join, firstKey)
+		if p.rowsSubquery {
+			// INSERT only needs missing keys. UPDATE has already restored
+			// existing rows, so do not compute the row delta and join the
+			// current target a second time.
+			p.insertQuery = fmt.Sprintf("select %s from %s s left join %s d on %s where d.%s is null",
+				branchRestoreColumns("s", p.columns), source, p.destination, join, firstKey)
+		}
 	} else {
 		beforeName := branchDatabaseTable(stmt.Before, table)
 		beforeDef, err := before.restoreTable(stmt.Before, table)
@@ -286,6 +294,14 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 			branchRestoreColumns("b", p.columns), beforeSQL, afterSQL, join, firstKey, branchRestoreDifferent("a", "b", p.columns, p.keys))
 		p.deletesQuery = fmt.Sprintf("select %s from %s a left join %s b on %s where b.%s is null",
 			branchRestoreColumns("a", p.keys), afterSQL, beforeSQL, join, firstKey)
+		// Restrict INSERT to before-images absent from the current target
+		// before comparing snapshots. Unchanged rows deleted after the
+		// reverted commit must still be excluded by the after-image check.
+		missing := fmt.Sprintf("select %s from %s b left join %s d on %s where d.%s is null",
+			branchRestoreColumns("b", p.columns), beforeSQL, p.destination, branchRestoreJoin("b", "d", p.keys), firstKey)
+		p.insertQuery = fmt.Sprintf("select %s from (%s) s left join %s a on %s where a.%s is null or %s",
+			branchRestoreColumns("s", p.columns), missing, afterSQL, branchRestoreJoin("s", "a", p.keys), firstKey,
+			branchRestoreDifferent("s", "a", p.columns, p.keys))
 	}
 	return p, nil
 }
@@ -329,7 +345,11 @@ func (p branchRestorePlan) applySQL() []string {
 	if len(assignments) > 0 {
 		sqls = append(sqls, fmt.Sprintf("update %s d inner join %s s on %s set %s", p.destination, rowsSource, join, strings.Join(assignments, ",")))
 	}
-	sqls = append(sqls, fmt.Sprintf("insert into %s (%s) select %s from %s s left join %s d on %s where d.%s is null",
-		p.destination, columns, branchRestoreColumns("s", p.columns), rowsSource, p.destination, join, quoteIdentifierForSQL(p.keys[0])))
+	if p.rowsSubquery && p.insertQuery != "" {
+		sqls = append(sqls, fmt.Sprintf("insert into %s (%s) %s", p.destination, columns, p.insertQuery))
+	} else {
+		sqls = append(sqls, fmt.Sprintf("insert into %s (%s) select %s from %s s left join %s d on %s where d.%s is null",
+			p.destination, columns, branchRestoreColumns("s", p.columns), rowsSource, p.destination, join, quoteIdentifierForSQL(p.keys[0])))
+	}
 	return sqls
 }

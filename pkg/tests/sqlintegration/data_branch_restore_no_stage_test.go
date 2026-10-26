@@ -48,8 +48,9 @@ func TestDataBranchRestoreRowsSubqueryReevaluatesTarget(t *testing.T) {
 				defer q("drop snapshot " + name + "_after")
 				defer db.ExecContext(context.Background(), "rollback")
 				// Current membership differs from both snapshots. UPDATE must repair
-				// id=2, INSERT must restore id=1, and REVERT must preserve ids=4/6.
-				q("delete from " + name + ".t where id=1")
+				// id=2, INSERT must restore id=1, and REVERT must preserve ids=4/6
+				// and the later deletion of unchanged id=3.
+				q("delete from " + name + ".t where id=1 or id=3")
 				q("insert into " + name + ".t values(2,222),(6,60)")
 				q("update " + name + ".t set v=400 where id=4")
 				read := func() []string {
@@ -70,7 +71,7 @@ func TestDataBranchRestoreRowsSubqueryReevaluatesTarget(t *testing.T) {
 				want := []string{"1:10", "2:20", "3:NULL", "4:40"}
 				if op == "revert" {
 					restore = fmt.Sprintf("data branch revert database %[1]s from %[1]s{snapshot='%[1]s_after'} against %[1]s{snapshot='%[1]s_before'}", name)
-					want = []string{"1:10", "2:20", "3:NULL", "4:400", "6:60"}
+					want = []string{"1:10", "2:20", "4:400", "6:60"}
 				}
 				q("begin")
 				q(restore)
