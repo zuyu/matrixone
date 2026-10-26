@@ -40,6 +40,7 @@ func TestBranchRestoreDeleteSubqueryEligibility(t *testing.T) {
 				p, err := planBranchRestore(stmt, "t", src, dst, before)
 				require.NoError(t, err)
 				require.Equal(t, operation == "revert" || fk == "none", p.deleteSubquery)
+				require.Equal(t, operation == "revert" || fk == "none", p.rowsSubquery)
 			})
 		}
 	}
@@ -129,6 +130,99 @@ func TestBranchRestoreDeleteSubqueryFailureRollsBack(t *testing.T) {
 			}
 			require.True(t, finished)
 			require.Equal(t, "drop temporary table if exists t_r", sqls[len(sqls)-1])
+		})
+	}
+}
+
+func TestBranchRestoreRowsSubqueryUsesNoStages(t *testing.T) {
+	for _, keys := range [][]string{{"id"}, nil} {
+		p := restoreWorkPlan("`db`.`t`")
+		p.keys = keys
+		p.rowsSubquery = true
+		p.deleteSubquery = len(keys) > 0
+		if len(keys) == 0 {
+			p.deletesQuery = ""
+		}
+		p.rowsEmpty, p.deletesEmpty = true, true // stale materialized-stage flags
+		var sqls []string
+		back := &restoreWorkExec{run: func(_ context.Context, sql string) error { sqls = append(sqls, sql); return nil }}
+		require.NoError(t, executeBranchRestorePlans(t.Context(), back, []branchRestorePlan{p}, "reset"))
+		if len(keys) > 0 {
+			require.Len(t, sqls, 3)
+		} else {
+			require.Len(t, sqls, 2)
+			require.Equal(t, "delete from `db`.`t` where true", sqls[0])
+		}
+		for _, sql := range sqls {
+			require.False(t, strings.HasPrefix(sql, "create") || strings.HasPrefix(sql, "drop") || strings.HasPrefix(sql, "select"))
+			if strings.HasPrefix(sql, "update") || strings.HasPrefix(sql, "insert") {
+				require.Contains(t, sql, "(select rows) s")
+			}
+		}
+	}
+	// A key-only table needs DELETE/INSERT, without an empty UPDATE.
+	p := restoreWorkPlan("keys_only")
+	p.columns = p.keys
+	p.rowsSubquery = true
+	p.deleteSubquery = true
+	require.Len(t, p.applySQL(), 2)
+}
+
+func TestBranchRestoreMixedStagesPrecedeDirectWrites(t *testing.T) {
+	plans := []branchRestorePlan{restoreWorkPlan("plain"), restoreWorkPlan("fk")}
+	plans[0].rowsSubquery, plans[0].deleteSubquery = true, true
+	var sqls []string
+	back := &restoreWorkExec{run: func(_ context.Context, sql string) error { sqls = append(sqls, sql); return nil }}
+	require.NoError(t, executeBranchRestorePlans(t.Context(), back, plans, "reset"))
+	require.True(t, strings.HasPrefix(sqls[0], "create temporary table fk_r"))
+	require.True(t, strings.HasPrefix(sqls[1], "create temporary table fk_d"))
+	require.True(t, strings.HasPrefix(sqls[2], "delete d from plain"))
+	require.Equal(t, "drop temporary table if exists fk_d,fk_r", sqls[len(sqls)-1])
+	for _, sql := range sqls[2:] {
+		require.False(t, strings.HasPrefix(sql, "create"))
+	}
+}
+
+func TestBranchRestoreWithoutStagesStillRollsBack(t *testing.T) {
+	for _, failure := range []string{"delete", "update", "insert", "cancel", "panic"} {
+		t.Run(failure, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			original := errors.New("apply failed")
+			back := &restoreWorkExec{run: func(_ context.Context, sql string) error {
+				require.False(t, strings.HasPrefix(sql, "create") || strings.HasPrefix(sql, "drop"))
+				if strings.HasPrefix(sql, failure) {
+					return original
+				}
+				if strings.HasPrefix(sql, "update") {
+					if failure == "cancel" {
+						cancel()
+						return ctx.Err()
+					}
+					if failure == "panic" {
+						panic(original)
+					}
+				}
+				return nil
+			}}
+			p := restoreWorkPlan("t")
+			p.rowsSubquery, p.deleteSubquery = true, true
+			finished := false
+			run := func() (err error) {
+				defer finishDataBranchComponent(ctx, func(cause error) error { finished = true; require.Error(t, cause); return cause }, &err)
+				return executeBranchRestorePlans(ctx, back, []branchRestorePlan{p}, "revert")
+			}
+			if failure == "panic" {
+				require.PanicsWithValue(t, original, func() { _ = run() })
+			} else {
+				err := run()
+				if failure == "cancel" {
+					require.ErrorIs(t, err, context.Canceled)
+				} else {
+					require.ErrorIs(t, err, original)
+				}
+			}
+			require.True(t, finished)
 		})
 	}
 }

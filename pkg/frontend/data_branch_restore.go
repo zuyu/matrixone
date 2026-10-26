@@ -33,6 +33,7 @@ type branchRestorePlan struct {
 	rowsQuery, deletesQuery string
 	rowsEmpty, deletesEmpty bool
 	deleteSubquery          bool
+	rowsSubquery            bool
 }
 
 // RESET restores data without replacing relation identities. REVERT applies
@@ -206,8 +207,8 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 	if err != nil {
 		return p, err
 	}
-	// The catalog resolved the named snapshot and validated its scope. CTAS
-	// needs the timestamp because its internal executor has no name resolver.
+	// The catalog resolved the named snapshot and validated its scope. Use
+	// its timestamp for background DML and any remaining CTAS stages.
 	if snapshot := source.snapshot; snapshot != nil && snapshot.TS != nil {
 		srcName.AtTsExpr = newMoTimestampHint(snapshot.TS.PhysicalTime)
 	}
@@ -236,6 +237,12 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 	if len(p.columns) == 0 {
 		return p, moerr.NewNotSupportedNoCtxf("table %q has no writable columns", table)
 	}
+	// REVERT reads an immutable before/after delta. A RESET without FK
+	// dependencies can re-evaluate its own current-vs-snapshot delta: DELETE
+	// removes only non-snapshot keys, UPDATE restores matching rows, and the
+	// following INSERT fills the remaining missing keys. FK-related RESETs
+	// retain pre-write materialization across earlier table cascades.
+	p.rowsSubquery = stmt.Operation == "revert" || (len(dstDef.Fkeys) == 0 && len(dstDef.RefChildTbls) == 0)
 	p.destination = branchRestoreTableSQL(dstName)
 	id := strings.ReplaceAll(uuid.NewString(), "-", "")
 	p.rowsTable = qualifiedTableName(stmt.Destination.ObjectName.String(), "__mo_branch_restore_"+id+"_r")
@@ -248,10 +255,7 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 		return p, nil
 	}
 	p.keys = dstKeys
-	// REVERT's delete delta reads only immutable snapshots. RESET also reads
-	// the current destination; keep those keys staged for FK-related tables
-	// so earlier table writes/cascades cannot change a later delete set.
-	p.deleteSubquery = stmt.Operation == "revert" || (len(dstDef.Fkeys) == 0 && len(dstDef.RefChildTbls) == 0)
+	p.deleteSubquery = p.rowsSubquery
 	firstKey := quoteIdentifierForSQL(p.keys[0])
 	if stmt.Operation == "reset" {
 		source := branchRestoreTableSQL(srcName)
@@ -288,12 +292,16 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 
 func (p branchRestorePlan) applySQL() []string {
 	columns := joinQuotedColumnNames(p.columns)
+	rowsSource := p.rowsTable
+	if p.rowsSubquery {
+		rowsSource = "(" + p.rowsQuery + ")"
+	}
 	if len(p.keys) == 0 {
 		// A WHERE clause keeps this as row DML; an unrestricted DELETE is
 		// optimized into TRUNCATE, which replaces identity and breaks lineage.
 		sqls := []string{"delete from " + p.destination + " where true"}
-		if !p.rowsEmpty {
-			sqls = append(sqls, fmt.Sprintf("insert into %s (%s) select %s from %s", p.destination, columns, columns, p.rowsTable))
+		if p.rowsSubquery || !p.rowsEmpty {
+			sqls = append(sqls, fmt.Sprintf("insert into %s (%s) select %s from %s s", p.destination, columns, branchRestoreColumns("s", p.columns), rowsSource))
 		}
 		return sqls
 	}
@@ -307,7 +315,7 @@ func (p branchRestorePlan) applySQL() []string {
 	} else if !p.deletesEmpty {
 		sqls = append(sqls, fmt.Sprintf("delete d from %s d inner join %s s on %s", p.destination, p.deletesTable, join))
 	}
-	if p.rowsEmpty {
+	if p.rowsEmpty && !p.rowsSubquery {
 		return sqls
 	}
 	var assignments []string
@@ -319,9 +327,9 @@ func (p branchRestorePlan) applySQL() []string {
 		assignments = append(assignments, "d."+q+"=s."+q)
 	}
 	if len(assignments) > 0 {
-		sqls = append(sqls, fmt.Sprintf("update %s d inner join %s s on %s set %s", p.destination, p.rowsTable, join, strings.Join(assignments, ",")))
+		sqls = append(sqls, fmt.Sprintf("update %s d inner join %s s on %s set %s", p.destination, rowsSource, join, strings.Join(assignments, ",")))
 	}
 	sqls = append(sqls, fmt.Sprintf("insert into %s (%s) select %s from %s s left join %s d on %s where d.%s is null",
-		p.destination, columns, branchRestoreColumns("s", p.columns), p.rowsTable, p.destination, join, quoteIdentifierForSQL(p.keys[0])))
+		p.destination, columns, branchRestoreColumns("s", p.columns), rowsSource, p.destination, join, quoteIdentifierForSQL(p.keys[0])))
 	return sqls
 }
