@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/stretchr/testify/require"
@@ -41,6 +42,13 @@ func TestBranchRestoreDeleteSubqueryEligibility(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, operation == "revert" || fk == "none", p.deleteSubquery)
 				require.Equal(t, operation == "revert" || fk == "none", p.rowsSubquery)
+				if operation == "reset" && fk == "none" {
+					require.Contains(t, p.updateQuery, "`src`.`t`{MO_TS = 200}")
+					require.NotContains(t, p.updateQuery, "`dst`")
+					require.Equal(t, branchRestoreDifferent("s", "d", p.columns, p.keys), p.updatePredicate)
+				} else {
+					require.Empty(t, p.updateQuery)
+				}
 			})
 		}
 	}
@@ -224,5 +232,43 @@ func TestBranchRestoreWithoutStagesStillRollsBack(t *testing.T) {
 			}
 			require.True(t, finished)
 		})
+	}
+}
+
+func TestBranchRestoreUpdateSkipsIdenticalCurrentRows(t *testing.T) {
+	p := restoreWorkPlan("`db`.`t`")
+	p.columns = []string{"tenant", "k`ey", "v`alue"}
+	p.keys = []string{"tenant", "k`ey"}
+	p.rowsSubquery, p.deleteSubquery = true, true
+	p.updateQuery = "select * from `db`.`t`{MO_TS = 100}"
+	p.updatePredicate = branchRestoreDifferent("d", "s", p.columns, p.keys)
+	update := p.applySQL()[1]
+	require.Contains(t, update, "inner join ("+p.updateQuery+") s")
+	require.Equal(t, 2, strings.Count(update, "`db`.`t`"), "one current scan and one historical scan")
+	require.Contains(t, update, "on d.`tenant`=s.`tenant` and d.`k``ey`=s.`k``ey`")
+	require.Contains(t, update, "set d.`v``alue`=s.`v``alue` where (not (d.`v``alue` <=> s.`v``alue`))")
+	// REVERT retains its before/after delta but filters current equality too.
+	p.updateQuery = ""
+	update = p.applySQL()[1]
+	require.Contains(t, update, "inner join ("+p.rowsQuery+") s")
+	require.Contains(t, update, " where (not (d.`v``alue` <=> s.`v``alue`))")
+	// FK-related RESET still applies the materialized pre-cascade delta.
+	p.rowsSubquery = false
+	require.NotContains(t, p.applySQL()[1], " where ")
+}
+
+func TestBranchRestoreUpdateEqualityNeedsExactTypes(t *testing.T) {
+	for _, typ := range []types.T{types.T_int32, types.T_decimal128, types.T_datetime,
+		types.T_varchar, types.T_float64, types.T_json} {
+		dst, before := restoreMetadataCatalog(0, 1).definitions["t"], restoreMetadataCatalog(1, 1).definitions["t"]
+		dst.Cols[1].Typ = plan.Type{Id: int32(typ), Width: 20, Scale: 2}
+		before.Cols[1].Typ = dst.Cols[1].Typ
+		want := typ == types.T_int32 || typ == types.T_decimal128 || typ == types.T_datetime
+		require.Equal(t, want, branchRestoreUpdateEqualitySafe(dst, before, []string{"id"}), typ.String())
+		before.Cols[1].Typ.Scale++
+		require.False(t, branchRestoreUpdateEqualitySafe(dst, before, []string{"id"}))
+		before.Cols[1].Typ = dst.Cols[1].Typ
+		before.Cols[1].Typ.Id = int32(types.T_int64)
+		require.False(t, branchRestoreUpdateEqualitySafe(dst, before, []string{"id"}))
 	}
 }

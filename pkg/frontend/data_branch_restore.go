@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
@@ -32,6 +33,8 @@ type branchRestorePlan struct {
 	rowsTable, deletesTable string
 	rowsQuery, deletesQuery string
 	insertQuery             string
+	updateQuery             string
+	updatePredicate         string
 	rowsEmpty, deletesEmpty bool
 	deleteSubquery          bool
 	rowsSubquery            bool
@@ -174,6 +177,36 @@ func branchRestoreDifferent(left, right string, columns, keys []string) string {
 	return "(" + strings.Join(parts, " or ") + ")"
 }
 
+// Equality can skip REVERT candidates only when it implies the same stored
+// value. Keep the original UPDATE for strings (collation/padding), floating
+// point (NaN/signed zero), complex types and historical type changes.
+func branchRestoreUpdateEqualitySafe(dst, before *plan.TableDef, keys []string) bool {
+	for _, col := range dst.Cols {
+		if !isDataBranchWritableColumn(col) || slices.Contains(keys, col.Name) {
+			continue
+		}
+		var prior *plan.ColDef
+		for _, candidate := range before.Cols {
+			if candidate.Name == col.Name {
+				prior = candidate
+				break
+			}
+		}
+		if prior == nil || col.Typ.Id != prior.Typ.Id || col.Typ.Width != prior.Typ.Width || col.Typ.Scale != prior.Typ.Scale {
+			return false
+		}
+		switch types.T(col.Typ.Id) {
+		case types.T_bool, types.T_int8, types.T_int16, types.T_int32, types.T_int64,
+			types.T_uint8, types.T_uint16, types.T_uint32, types.T_uint64,
+			types.T_decimal64, types.T_decimal128, types.T_date, types.T_datetime,
+			types.T_timestamp, types.T_time, types.T_uuid:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func branchRestoreWritableColumns(def *plan.TableDef) []string {
 	var names []string
 	for _, col := range def.Cols {
@@ -269,6 +302,12 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 		p.deletesQuery = fmt.Sprintf("select %s from %s d left join %s s on %s where s.%s is null",
 			branchRestoreColumns("d", p.keys), p.destination, source, join, firstKey)
 		if p.rowsSubquery {
+			// UPDATE joins the snapshot to the current target once and
+			// compares their values directly. The row-delta query would
+			// scan the current target twice and include missing rows that
+			// only INSERT can restore.
+			p.updateQuery = "select " + branchRestoreColumns("s", p.columns) + " from " + source + " s"
+			p.updatePredicate = branchRestoreDifferent("s", "d", p.columns, p.keys)
 			// INSERT only needs missing keys. UPDATE has already restored
 			// existing rows, so do not compute the row delta and join the
 			// current target a second time.
@@ -290,6 +329,9 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 		}
 		if err = checkColumns(beforeDef); err != nil {
 			return p, err
+		}
+		if branchRestoreUpdateEqualitySafe(dstDef, beforeDef, p.keys) {
+			p.updatePredicate = branchRestoreDifferent("d", "s", p.columns, p.keys)
 		}
 		afterSQL, beforeSQL := branchRestoreTableSQL(srcName), branchRestoreTableSQL(beforeName)
 		join := branchRestoreJoin("a", "b", p.keys)
@@ -346,7 +388,16 @@ func (p branchRestorePlan) applySQL() []string {
 		assignments = append(assignments, "d."+q+"=s."+q)
 	}
 	if len(assignments) > 0 {
-		sqls = append(sqls, fmt.Sprintf("update %s d inner join %s s on %s set %s", p.destination, rowsSource, join, strings.Join(assignments, ",")))
+		updateSource, predicate := rowsSource, ""
+		if p.rowsSubquery {
+			if p.updateQuery != "" {
+				updateSource = "(" + p.updateQuery + ")"
+			}
+			if p.updatePredicate != "" {
+				predicate = " where " + p.updatePredicate
+			}
+		}
+		sqls = append(sqls, fmt.Sprintf("update %s d inner join %s s on %s set %s%s", p.destination, updateSource, join, strings.Join(assignments, ","), predicate))
 	}
 	if p.rowsSubquery && p.insertQuery != "" {
 		sqls = append(sqls, fmt.Sprintf("insert into %s (%s) %s", p.destination, columns, p.insertQuery))
