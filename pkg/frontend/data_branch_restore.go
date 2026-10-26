@@ -32,6 +32,8 @@ type branchRestorePlan struct {
 	rowsTable, deletesTable string
 	rowsQuery, deletesQuery string
 	rowsEmpty, deletesEmpty bool
+	deleteKeyUnsigned       []bool
+	deleteValues            string
 }
 
 // RESET restores data without replacing relation identities. REVERT applies
@@ -247,6 +249,7 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 		return p, nil
 	}
 	p.keys = dstKeys
+	p.deleteKeyUnsigned = branchRestoreIntegerKeys(p.keys, srcDef, dstDef)
 	firstKey := quoteIdentifierForSQL(p.keys[0])
 	if stmt.Operation == "reset" {
 		source := branchRestoreTableSQL(srcName)
@@ -271,6 +274,7 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 		if err = checkColumns(beforeDef); err != nil {
 			return p, err
 		}
+		p.deleteKeyUnsigned = branchRestoreIntegerKeys(p.keys, srcDef, dstDef, beforeDef)
 		afterSQL, beforeSQL := branchRestoreTableSQL(srcName), branchRestoreTableSQL(beforeName)
 		join := branchRestoreJoin("a", "b", p.keys)
 		p.rowsQuery = fmt.Sprintf("select %s from %s b left join %s a on %s where a.%s is null or %s",
@@ -295,7 +299,12 @@ func (p branchRestorePlan) applySQL() []string {
 	join := branchRestoreJoin("d", "s", p.keys)
 	var sqls []string
 	if !p.deletesEmpty {
-		sqls = append(sqls, fmt.Sprintf("delete d from %s d inner join %s s on %s", p.destination, p.deletesTable, join))
+		if p.deleteValues != "" {
+			info := applyBatchInfo{deleteKeyNames: p.keys}
+			sqls = append(sqls, info.deleteInSQL(p.destination, p.deleteValues))
+		} else {
+			sqls = append(sqls, fmt.Sprintf("delete d from %s d inner join %s s on %s", p.destination, p.deletesTable, join))
+		}
 	}
 	if p.rowsEmpty {
 		return sqls

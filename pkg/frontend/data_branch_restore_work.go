@@ -25,19 +25,20 @@ import (
 // Nested CTAS INSERTs, catalog/authorization SQL and transaction finish are
 // outside this work event. It must not be interpreted as request success.
 type branchRestoreWork struct {
-	operation                  string
-	tables                     int
-	started                    time.Time
-	counts                     map[string]int
-	phases                     map[string]time.Duration
-	emptyStages, unknownStages int
-	materializedRows           int64
+	operation                      string
+	tables                         int
+	started                        time.Time
+	counts                         map[string]int
+	phases                         map[string]time.Duration
+	emptyStages, unknownStages     int
+	materializedRows               int64
+	inlineDeletes, fallbackDeletes int
 }
 
 func newBranchRestoreWork(operation string, tables int) *branchRestoreWork {
 	w := &branchRestoreWork{operation: operation, tables: tables, started: time.Now(),
 		counts: make(map[string]int), phases: make(map[string]time.Duration)}
-	for _, phase := range []string{"stage_create", "delete", "update", "insert", "stage_drop"} {
+	for _, phase := range []string{"delete_probe", "stage_create", "delete", "update", "insert", "stage_drop"} {
 		w.counts[phase] = 0
 	}
 	return w
@@ -68,10 +69,11 @@ func (w *branchRestoreWork) finish(err *error) {
 		phases[phase] = float64(w.phases[phase]) / float64(time.Millisecond)
 	}
 	phases["other"] = float64(max(time.Duration(0), total-measured)) / float64(time.Millisecond)
-	logutil.Info("DataBranch-Restore-Work", zap.Int("schema_version", 1),
+	logutil.Info("DataBranch-Restore-Work", zap.Int("schema_version", 2),
 		zap.String("request_id", uuid.NewString()), zap.String("operation", w.operation),
 		zap.String("status", status), zap.String("staging", "temporary"), zap.Int("table_count", w.tables),
 		zap.Int("sql_statements", statements), zap.Any("sql_counts", w.counts),
+		zap.Int("inline_delete_tables", w.inlineDeletes), zap.Int("fallback_delete_tables", w.fallbackDeletes),
 		zap.Int("empty_stages", w.emptyStages), zap.Int("unknown_stages", w.unknownStages),
 		zap.Int64("materialized_rows", w.materializedRows),
 		zap.Float64("total_ms", float64(total)/float64(time.Millisecond)), zap.Any("phases_ms", phases))
@@ -105,6 +107,15 @@ func executeBranchRestorePlans(ctx context.Context, bh BackgroundExec, plans []b
 		} {
 			if stage.query == "" {
 				continue
+			}
+			if stage.table == p.deletesTable && len(p.deleteKeyUnsigned) > 0 {
+				used, probeErr := work.probeDeleteKeys(ctx, bh, p)
+				if probeErr != nil {
+					return probeErr
+				}
+				if used {
+					continue
+				}
 			}
 			// Reset first: an executor that cannot report this CTAS must not
 			// accidentally reuse the previous statement's affected-row count.
