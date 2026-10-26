@@ -628,6 +628,12 @@ func getBackExecutorInternal(
 	}
 	if explicitTxn {
 		bh = ses.GetShareTxnBackgroundExec(ctx, false)
+		// SQL classification is local to the executor, independent of the
+		// caller-owned transaction. Preserve the DML planning opt-out here
+		// too, while leaving the caller's transaction settings untouched.
+		if back, ok := bh.(*backExec); ok && len(opts) > 0 && opts[0] != nil {
+			back.backSes.disableImplicitRestore = opts[0].disableImplicitRestore
+		}
 		bh.ClearExecResultSet()
 		return bh, func(err error) error {
 			bh.Close()

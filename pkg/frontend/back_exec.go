@@ -241,7 +241,7 @@ func (back *backExec) exec(ctx context.Context, sql string, sqlMode string, useS
 	}
 
 	var isRestore bool
-	if len(statements) == 1 {
+	if len(statements) == 1 && !back.backSes.disableImplicitRestore {
 		isRestore = isBackgroundRestoreSQL(statements[0], sql)
 	}
 
@@ -1177,6 +1177,7 @@ type backSession struct {
 	hasEffectiveMatrixOneNativeMode   bool
 	forcePessimisticRC                bool
 	cloneSnapshotUsesBackgroundTxn    bool
+	disableImplicitRestore            bool
 	cancelTxnCreateWithRequest        bool
 	authorizationSnapshot             *txnclient.SnapshotAdmission
 	processHook                       backExecProcessHook

@@ -56,8 +56,11 @@ func handleBranchRestore(execCtx *ExecCtx, ses *Session, stmt *tree.DataBranchDa
 		(stmt.Operation == "revert" && stmt.Before.AtTsExpr == nil) {
 		return moerr.NewInvalidInputNoCtx("RESET/REVERT require historical source endpoints and a current destination")
 	}
+	// These are in-place DML operations, not bulk disaster-recovery replay.
+	// MO_TS reads must retain normal statistics, duplicate checks and write
+	// planning instead of triggering the background SQL restore heuristic.
 	bh, finish, err := getDataBranchMutationExecutor(ctx, ses, false,
-		&BackgroundExecOption{forcePessimisticRC: true})
+		&BackgroundExecOption{forcePessimisticRC: true, disableImplicitRestore: true})
 	if err != nil {
 		return err
 	}

@@ -750,6 +750,9 @@ type BackgroundExecOption struct {
 	fromRealUser                   bool
 	forcePessimisticRC             bool
 	cloneSnapshotUsesBackgroundTxn bool
+	// disableImplicitRestore keeps timestamped SQL on ordinary DML planning.
+	// Explicit ExecRestore calls still select bulk restore semantics.
+	disableImplicitRestore bool
 	// cancelTxnCreateWithRequest is reserved for short-lived background
 	// transactions whose request context owns a blocked TxnClient.New call.
 	cancelTxnCreateWithRequest bool

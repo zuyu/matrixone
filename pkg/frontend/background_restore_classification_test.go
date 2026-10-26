@@ -122,6 +122,27 @@ func TestBackgroundRestoreClassificationUsesParsedStatement(t *testing.T) {
 			require.Equal(t, tc.want, gotRestore)
 		})
 	}
+	ordinary := ses.InitBackExec(nil, "", fakeDataSetFetcher2,
+		&BackgroundExecOption{disableImplicitRestore: true}).(*backExec)
+	t.Cleanup(ordinary.Close)
+	for _, sql := range []string{
+		"insert into x select * from y{MO_TS=42}",
+		"insert into x values(1) /* MO_TS = 42 */",
+		restoreTableDataByTsSQL("db", "x", 42),
+	} {
+		require.NoError(t, ordinary.Exec(ctx, sql))
+		require.False(t, gotRestore, "timestamped ordinary DML must not select bulk restore")
+		require.NoError(t, ordinary.ExecWithSQLMode(ctx, sql, "ANSI_QUOTES"))
+		require.False(t, gotRestore)
+		// The option only disables inference, not an explicit restore request.
+		require.NoError(t, ordinary.ExecRestore(ctx, sql, 0, 0))
+		require.True(t, gotRestore)
+		// Explicit restore must not leak into the next ordinary statement.
+		require.NoError(t, ordinary.Exec(ctx, sql))
+		require.False(t, gotRestore)
+		require.NoError(t, back.Exec(ctx, sql))
+		require.True(t, gotRestore, "other executors retain their legacy restore contract")
+	}
 	for _, sql := range []string{"select (", "select 1; select 2"} {
 		before := calls
 		require.Error(t, back.Exec(ctx, sql))
