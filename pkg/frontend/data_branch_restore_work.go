@@ -32,13 +32,13 @@ type branchRestoreWork struct {
 	phases                         map[string]time.Duration
 	emptyStages, unknownStages     int
 	materializedRows               int64
-	inlineDeletes, fallbackDeletes int
+	subqueryDeletes, stagedDeletes int
 }
 
 func newBranchRestoreWork(operation string, tables int) *branchRestoreWork {
 	w := &branchRestoreWork{operation: operation, tables: tables, started: time.Now(),
 		counts: make(map[string]int), phases: make(map[string]time.Duration)}
-	for _, phase := range []string{"delete_probe", "stage_create", "delete", "update", "insert", "stage_drop"} {
+	for _, phase := range []string{"stage_create", "delete", "update", "insert", "stage_drop"} {
 		w.counts[phase] = 0
 	}
 	return w
@@ -69,11 +69,11 @@ func (w *branchRestoreWork) finish(err *error) {
 		phases[phase] = float64(w.phases[phase]) / float64(time.Millisecond)
 	}
 	phases["other"] = float64(max(time.Duration(0), total-measured)) / float64(time.Millisecond)
-	logutil.Info("DataBranch-Restore-Work", zap.Int("schema_version", 2),
+	logutil.Info("DataBranch-Restore-Work", zap.Int("schema_version", 3),
 		zap.String("request_id", uuid.NewString()), zap.String("operation", w.operation),
 		zap.String("status", status), zap.String("staging", "temporary"), zap.Int("table_count", w.tables),
 		zap.Int("sql_statements", statements), zap.Any("sql_counts", w.counts),
-		zap.Int("inline_delete_tables", w.inlineDeletes), zap.Int("fallback_delete_tables", w.fallbackDeletes),
+		zap.Int("subquery_delete_tables", w.subqueryDeletes), zap.Int("staged_delete_tables", w.stagedDeletes),
 		zap.Int("empty_stages", w.emptyStages), zap.Int("unknown_stages", w.unknownStages),
 		zap.Int64("materialized_rows", w.materializedRows),
 		zap.Float64("total_ms", float64(total)/float64(time.Millisecond)), zap.Any("phases_ms", phases))
@@ -94,8 +94,9 @@ func executeBranchRestorePlans(ctx context.Context, bh BackgroundExec, plans []b
 	// including rollback after cancellation or a failed cleanup. DROP still
 	// removes the physical stages synchronously, without public-table catalog
 	// cleanup such as publication/view invalidation and role-privilege deletion.
-	// Preserve the original order: materialize every delta before any target
-	// write. Stage SELECTs also avoid same-table DELETE snapshot limitations.
+	// Materialize every row delta before any target write. FK-related RESET
+	// delete keys are staged too; other deletes keep their delta as a subquery
+	// evaluated by the DELETE statement, without a separate probe or CTAS.
 	for i := range plans {
 		p := &plans[i]
 		for _, stage := range []struct {
@@ -108,14 +109,8 @@ func executeBranchRestorePlans(ctx context.Context, bh BackgroundExec, plans []b
 			if stage.query == "" {
 				continue
 			}
-			if stage.table == p.deletesTable && len(p.deleteKeyUnsigned) > 0 {
-				used, probeErr := work.probeDeleteKeys(ctx, bh, p)
-				if probeErr != nil {
-					return probeErr
-				}
-				if used {
-					continue
-				}
+			if stage.table == p.deletesTable && p.deleteSubquery {
+				continue
 			}
 			// Reset first: an executor that cannot report this CTAS must not
 			// accidentally reuse the previous statement's affected-row count.
@@ -127,6 +122,9 @@ func executeBranchRestorePlans(ctx context.Context, bh BackgroundExec, plans []b
 				return err
 			}
 			stages = append(stages, stage.table)
+			if stage.table == p.deletesTable {
+				work.stagedDeletes++
+			}
 			rows := int64(-1)
 			if hasCount {
 				rows = provider.GetLastAffectedRows()
@@ -145,6 +143,9 @@ func executeBranchRestorePlans(ctx context.Context, bh BackgroundExec, plans []b
 	for _, p := range plans {
 		for _, sql := range p.applySQL() {
 			phase, _, _ := strings.Cut(sql, " ")
+			if phase == "delete" && p.deleteSubquery {
+				work.subqueryDeletes++
+			}
 			if err = work.exec(ctx, bh, phase, sql); err != nil {
 				return err
 			}

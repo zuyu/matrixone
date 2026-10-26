@@ -32,8 +32,7 @@ type branchRestorePlan struct {
 	rowsTable, deletesTable string
 	rowsQuery, deletesQuery string
 	rowsEmpty, deletesEmpty bool
-	deleteKeyUnsigned       []bool
-	deleteValues            string
+	deleteSubquery          bool
 }
 
 // RESET restores data without replacing relation identities. REVERT applies
@@ -249,7 +248,10 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 		return p, nil
 	}
 	p.keys = dstKeys
-	p.deleteKeyUnsigned = branchRestoreIntegerKeys(p.keys, srcDef, dstDef)
+	// REVERT's delete delta reads only immutable snapshots. RESET also reads
+	// the current destination; keep those keys staged for FK-related tables
+	// so earlier table writes/cascades cannot change a later delete set.
+	p.deleteSubquery = stmt.Operation == "revert" || (len(dstDef.Fkeys) == 0 && len(dstDef.RefChildTbls) == 0)
 	firstKey := quoteIdentifierForSQL(p.keys[0])
 	if stmt.Operation == "reset" {
 		source := branchRestoreTableSQL(srcName)
@@ -274,7 +276,6 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 		if err = checkColumns(beforeDef); err != nil {
 			return p, err
 		}
-		p.deleteKeyUnsigned = branchRestoreIntegerKeys(p.keys, srcDef, dstDef, beforeDef)
 		afterSQL, beforeSQL := branchRestoreTableSQL(srcName), branchRestoreTableSQL(beforeName)
 		join := branchRestoreJoin("a", "b", p.keys)
 		p.rowsQuery = fmt.Sprintf("select %s from %s b left join %s a on %s where a.%s is null or %s",
@@ -298,13 +299,13 @@ func (p branchRestorePlan) applySQL() []string {
 	}
 	join := branchRestoreJoin("d", "s", p.keys)
 	var sqls []string
-	if !p.deletesEmpty {
-		if p.deleteValues != "" {
-			info := applyBatchInfo{deleteKeyNames: p.keys}
-			sqls = append(sqls, info.deleteInSQL(p.destination, p.deleteValues))
-		} else {
-			sqls = append(sqls, fmt.Sprintf("delete d from %s d inner join %s s on %s", p.destination, p.deletesTable, join))
-		}
+	if p.deleteSubquery {
+		// The derived-table boundary permits reading the target's historical
+		// and current views in DELETE without MySQL's direct-target-subquery
+		// restriction. Keep the delta in the SQL plan; no literal key lists.
+		sqls = append(sqls, fmt.Sprintf("delete d from %s d inner join (%s) s on %s", p.destination, p.deletesQuery, join))
+	} else if !p.deletesEmpty {
+		sqls = append(sqls, fmt.Sprintf("delete d from %s d inner join %s s on %s", p.destination, p.deletesTable, join))
 	}
 	if p.rowsEmpty {
 		return sqls
