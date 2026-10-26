@@ -33,6 +33,7 @@ type branchRestorePlan struct {
 	rowsTable, deletesTable string
 	rowsQuery, deletesQuery string
 	insertQuery             string
+	deleteKeepQuery         string
 	updateQuery             string
 	updatePredicate         string
 	rowsEmpty, deletesEmpty bool
@@ -302,6 +303,10 @@ func planBranchRestore(stmt *tree.DataBranchDatabase, table string, source, dest
 		p.deletesQuery = fmt.Sprintf("select %s from %s d left join %s s on %s where s.%s is null",
 			branchRestoreColumns("d", p.keys), p.destination, source, join, firstKey)
 		if p.rowsSubquery {
+			// DELETE needs only the snapshot keys to retain. Joining the
+			// current-vs-snapshot delete delta back to the target scans the
+			// current table twice; the anti join can delete its own rows.
+			p.deleteKeepQuery = "select " + branchRestoreColumns("s", p.keys) + " from " + source + " s"
 			// UPDATE joins the snapshot to the current target once and
 			// compares their values directly. The row-delta query would
 			// scan the current target twice and include missing rows that
@@ -368,7 +373,13 @@ func (p branchRestorePlan) applySQL() []string {
 	}
 	join := branchRestoreJoin("d", "s", p.keys)
 	var sqls []string
-	if p.deleteSubquery {
+	if p.deleteSubquery && p.deleteKeepQuery != "" {
+		// Keep the historical read behind a derived-table boundary for
+		// same-table time travel. The NOT NULL primary-key marker selects
+		// exactly the current rows absent from the snapshot.
+		sqls = append(sqls, fmt.Sprintf("delete d from %s d left join (%s) s on %s where s.%s is null",
+			p.destination, p.deleteKeepQuery, join, quoteIdentifierForSQL(p.keys[0])))
+	} else if p.deleteSubquery {
 		// The derived-table boundary permits reading the target's historical
 		// and current views in DELETE without MySQL's direct-target-subquery
 		// restriction. Keep the delta in the SQL plan; no literal key lists.

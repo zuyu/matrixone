@@ -43,10 +43,15 @@ func TestBranchRestoreDeleteSubqueryEligibility(t *testing.T) {
 				require.Equal(t, operation == "revert" || fk == "none", p.deleteSubquery)
 				require.Equal(t, operation == "revert" || fk == "none", p.rowsSubquery)
 				if operation == "reset" && fk == "none" {
+					require.Contains(t, p.deleteKeepQuery, "`src`.`t`{MO_TS = 200}")
+					require.NotContains(t, p.deleteKeepQuery, "`dst`")
+					require.NotContains(t, p.deleteKeepQuery, "`v`")
+					require.Contains(t, p.applySQL()[0], "left join ("+p.deleteKeepQuery+") s")
 					require.Contains(t, p.updateQuery, "`src`.`t`{MO_TS = 200}")
 					require.NotContains(t, p.updateQuery, "`dst`")
 					require.Equal(t, branchRestoreDifferent("s", "d", p.columns, p.keys), p.updatePredicate)
 				} else {
+					require.Empty(t, p.deleteKeepQuery)
 					require.Empty(t, p.updateQuery)
 				}
 			})
@@ -271,4 +276,19 @@ func TestBranchRestoreUpdateEqualityNeedsExactTypes(t *testing.T) {
 		before.Cols[1].Typ.Id = int32(types.T_int64)
 		require.False(t, branchRestoreUpdateEqualitySafe(dst, before, []string{"id"}))
 	}
+}
+
+func TestBranchRestoreDeleteKeepsSnapshotKeys(t *testing.T) {
+	p := restoreWorkPlan("`db`.`t`")
+	p.columns = []string{"tenant", "k`ey", "value"}
+	p.keys = []string{"tenant", "k`ey"}
+	p.deleteSubquery = true
+	p.deleteKeepQuery = "select s.tenant,s.`k``ey` from `db`.`t`{MO_TS = 100} s"
+	p.deletesEmpty = true // Materialized-stage flags cannot skip the direct path.
+	deleteSQL := p.applySQL()[0]
+	require.Equal(t, "delete d from `db`.`t` d left join ("+p.deleteKeepQuery+") s on d.`tenant`=s.`tenant` and d.`k``ey`=s.`k``ey` where s.`tenant` is null", deleteSQL)
+	require.Equal(t, 2, strings.Count(deleteSQL, "`db`.`t`"))
+	// Staged FK plans must not use a direct query even if one was populated.
+	p.deleteSubquery, p.deletesEmpty = false, false
+	require.Contains(t, p.applySQL()[0], "inner join "+p.deletesTable+" s")
 }
